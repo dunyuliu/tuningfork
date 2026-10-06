@@ -1,0 +1,18 @@
+{
+ "case": "text-nothink",
+ "seed": 2,
+ "tools": false,
+ "parallel": true,
+ "thinking": false,
+ "finish_reason": "stop",
+ "completion_tokens": 2,
+ "pieces": [
+  "Bonjour",
+  ""
+ ],
+ "message": {
+  "content": "Bonjour",
+  "reasoning_content": "",
+  "tool_calls": []
+ }
+}

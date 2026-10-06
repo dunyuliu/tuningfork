@@ -1,0 +1,19 @@
+ab at run <run pilot> step 1 — after the result of read_file
+  sent stream=None (recorded: True)
+  sent stream_options=None (recorded: {'include_usage': True})
+  sent max_tokens=4096 (recorded: 65536)
+  sent cache_prompt=False (recorded: None)
+  swapped   <tmp>/skill/SKILL.md → <tmp>/skill/SKILL.v2.md
+
+   behaviour                                                                original             variant              p adj.
+A  write_file(content='{"amount_total":61.5,"row_count":4}', … (+19 chars)  0/3   0% [0%-56%]    3/3 100% [44%-100%]  0.200 
+B  write_file(content='{"count":4,"total":61.5}', path='repor… (+8 chars)   3/3 100% [44%-100%]  0/3   0% [0%-56%]    0.200 
+p adj.: Fisher exact per behaviour, Bonferroni-corrected for 2 comparisons
+
+target (declared before sampling): behaviour matching /row_count/
+  original  0/3   0% [0%-56%]
+  variant   3/3 100% [44%-100%]
+  Fisher exact p = 0.100 → not significant at α=0.05
+  not the same as no effect: a difference this size would take ~3 samples per arm to detect reliably
+
+The 1 model-written message(s) before this step were generated under the original wording, and both arms inherit them. A checkpoint A/B is a fast screen; confirm a winner with full runs.

@@ -1,0 +1,133 @@
+"""The MCP tool list: every job kind decided on, every schema real JSON Schema, small enough
+to send, and the same order every time."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import re
+
+import pytest
+
+pytest.importorskip("mcp")
+
+from tuningfork.mcp import schema  # noqa: E402
+from tuningfork.mcp.server import ToolServer  # noqa: E402
+from tuningfork.mcp.tools import input_schema, registry  # noqa: E402
+from tuningfork.ops.catalog import CATALOG  # noqa: E402
+from tuningfork.ops.common import OperationError  # noqa: E402
+
+
+def test_every_kind_is_offered_or_excluded_with_a_reason():
+    """A new job kind fails here until someone decides whether an agent may start it."""
+    offered = set(schema.EVIDENCE) | set(schema.HARNESS)
+    assert set(CATALOG) == offered | set(schema.EXCLUDED)
+    assert not set(schema.EVIDENCE) & set(schema.HARNESS)
+    assert not offered & set(schema.EXCLUDED)
+    assert all(reason for reason in schema.EXCLUDED.values())
+
+
+@pytest.mark.parametrize("toolset", ["evidence", "all"])
+def test_every_schema_is_json_schema_and_closed(toolset):
+    jsonschema = pytest.importorskip("jsonschema")
+    for tool in registry(toolset).values():
+        found = input_schema(tool, max_wait=120)
+        jsonschema.Draft202012Validator.check_schema(found)
+        assert found["type"] == "object" and found["additionalProperties"] is False, tool.name
+
+
+def test_names_suit_every_client():
+    for tool in registry("all").values():
+        assert re.fullmatch(r"[a-z0-9_]{1,64}", tool.name), tool.name
+
+
+def test_no_kind_has_its_own_dry_run_or_wait():
+    for kind in CATALOG.values():
+        names = {spec.name for spec in dataclasses.fields(kind.params)}
+        assert not names & {"dry_run", "wait_seconds"}, kind.name
+
+
+def test_the_tool_list_is_small_and_always_in_one_order():
+    server = ToolServer(store=None, jobs=None)
+    listed = [tool.model_dump(by_alias=True, exclude_none=True, mode="json") for tool in server.listed()]
+    assert len(json.dumps(listed)) <= 24_000, len(json.dumps(listed))
+    names = [tool["name"] for tool in listed]
+    assert names[0] == "list_tasks" and names[-1] == "cancel_job"
+    assert names == [tool.name for tool in ToolServer(store=None, jobs=None).listed()]
+    starts = [name for name in names if name.startswith("start_")]
+    assert starts == ["start_resample", "start_tokens", "start_forking_tokens", "start_ab", "start_server_check"]
+
+
+def test_the_default_runs_nothing_on_the_machine():
+    evidence, everything = registry("evidence"), registry("all")
+    assert not any(tool.machine for tool in evidence.values())
+    assert "start_batch" not in evidence and "start_check_trial" not in evidence
+    assert everything["start_batch"].machine and everything["start_batch"].annotations()["openWorldHint"]
+    reads = [tool for tool in evidence.values() if tool.read is not None]
+    assert all(tool.annotations()["readOnlyHint"] for tool in reads)
+    with pytest.raises(OperationError, match="no toolset"):
+        registry("everything")
+
+
+class TestJobArguments:
+    def test_a_step_may_be_a_number(self):
+        call = schema.read_job_call(CATALOG["resample"], {"run": "a", "step": 3}, max_wait=120)
+        assert call.params == {"run": "a", "step": "3"} and call.dry_run is False and call.wait_seconds == 30
+        step = input_schema(registry()["start_resample"], max_wait=120)["properties"]["step"]
+        assert step["type"] == ["integer", "string"]
+
+    def test_a_fork_never_stops_for_a_person(self):
+        call = schema.read_job_call(CATALOG["fork"], {"run": "a", "step": "1"}, max_wait=120)
+        assert call.params["hold"] == "none"
+        assert "hold" not in input_schema(registry("all")["start_fork"], max_wait=120)["properties"]
+        with pytest.raises(OperationError) as refused:
+            schema.read_job_call(CATALOG["fork"], {"run": "a", "step": "1", "hold": "step"}, max_wait=120)
+        assert refused.value.field == "hold"
+
+    def test_a_check_is_never_a_shell_command(self):
+        kind = CATALOG["check-trial"]
+        with pytest.raises(OperationError) as refused:
+            schema.read_job_call(kind, {"check": "rm -rf ~"}, max_wait=120)
+        assert refused.value.field == "check"
+        call = schema.read_job_call(kind, {"check": {"reply_contains": "done"}}, max_wait=120)
+        assert call.params["check"] == {"reply_contains": "done"}
+        check = input_schema(registry("all")["start_check_trial"], max_wait=120)["properties"]["check"]
+        assert check["type"] == "object"
+
+    @pytest.mark.parametrize("wait", [500, -1, True, "10"])
+    def test_a_wait_is_a_bounded_whole_number(self, wait):
+        with pytest.raises(OperationError) as refused:
+            schema.read_job_call(CATALOG["resample"], {"run": "a", "step": "1", "wait_seconds": wait}, max_wait=120)
+        assert refused.value.field == "wait_seconds"
+
+    def test_dry_run_is_true_or_false(self):
+        with pytest.raises(OperationError) as refused:
+            schema.read_job_call(CATALOG["resample"], {"run": "a", "step": "1", "dry_run": "yes"}, max_wait=120)
+        assert refused.value.field == "dry_run"
+
+
+class TestTheRefineToolset:
+    def test_it_carries_the_loop_and_the_default_stays_as_it_was(self):
+        refine, evidence = registry("refine"), registry("evidence")
+        assert [name for name in refine if name.startswith("start_")] == [
+            "start_refinement", "start_resample", "start_ab", "start_screen"]
+        assert {"show_refinement", "propose_edit"} <= set(refine)
+        assert not {"start_screen", "propose_edit", "show_refinement"} & set(evidence)
+        assert refine["propose_edit"].annotations()["readOnlyHint"] is False
+
+    def test_the_built_in_proposer_is_never_offered_to_an_agent(self):
+        for toolset in ("evidence", "refine", "all"):
+            assert "start_propose" not in registry(toolset)
+        assert "person" in schema.EXCLUDED["propose"]
+
+    @pytest.mark.parametrize("toolset, budget", [("refine", 24_000), ("all", 40_000)])
+    def test_each_toolset_stays_small(self, toolset, budget):
+        listed = [tool.model_dump(by_alias=True, exclude_none=True, mode="json")
+                  for tool in ToolServer(store=None, jobs=None, toolset=toolset).listed()]
+        assert len(json.dumps(listed)) <= budget, len(json.dumps(listed))
+
+    def test_the_loops_instructions_come_with_its_tools(self):
+        from tuningfork.mcp.server import instructions
+
+        assert "start_refinement" in instructions("refine") and "start_refinement" not in instructions("evidence")
+        assert "a person's decision" in instructions("all")

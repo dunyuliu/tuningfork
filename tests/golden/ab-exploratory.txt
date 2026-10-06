@@ -1,0 +1,23 @@
+run <run pilot> step 1 — 2 samples per arm from http://upstream.test
+  context   4 messages, after the result of read_file
+  sampling  the recorded conditions (the request's own parameters, else server defaults)
+  budget    max_tokens 4096, concurrency 1
+  swapping  <tmp>/skill/SKILL.md → <tmp>/skill/SKILL.v2.md
+            found: full, lines 1-7, in message 0 (system) at chars 109-186
+  target    none declared — the comparison will be exploratory
+
+  original   1/2  write_file(content='{"count":4,"total":61.5}', path='report.json… (+2 chars)  <seconds>
+  original   2/2  write_file(content='{"count":4,"total":61.5}', path='report.json… (+2 chars)  <seconds>
+  variant    1/2  write_file(content='{"amount_total":61.5,"row_count":4}', path='… (+13 chars)  <seconds>
+  variant    2/2  write_file(content='{"amount_total":61.5,"row_count":4}', path='… (+13 chars)  <seconds>
+
+   behaviour                                                                original             variant              p adj.
+A  write_file(content='{"amount_total":61.5,"row_count":4}', … (+19 chars)  0/2   0% [0%-66%]    2/2 100% [34%-100%]  0.667 
+B  write_file(content='{"count":4,"total":61.5}', path='repor… (+8 chars)   2/2 100% [34%-100%]  0/2   0% [0%-66%]    0.667 
+p adj.: Fisher exact per behaviour, Bonferroni-corrected for 2 comparisons
+
+no target was declared, so this comparison is exploratory. Declare one with --target or --target-match to get a single confirmatory test.
+  no behaviour shifted significantly after correction
+
+The 1 model-written message(s) before this step were generated under the original wording, and both arms inherit them. A checkpoint A/B is a fast screen; confirm a winner with full runs.
+experiments <experiment 4> (original) and <experiment 5> (variant) · <minutes>

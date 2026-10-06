@@ -1,0 +1,28 @@
+run <run pilot> step 1 — 3 samples per arm from http://upstream.test
+  context   4 messages, after the result of read_file
+  sampling  the recorded conditions (the request's own parameters, else server defaults)
+  budget    max_tokens 4096, concurrency 1
+  swapping  <tmp>/skill/SKILL.md → <tmp>/skill/SKILL.v2.md
+            found: full, lines 1-7, in message 0 (system) at chars 109-186
+  target    behaviour matching /row_count/ (declared before sampling)
+
+  original   1/3  write_file(content='{"count":4,"total":61.5}', path='report.json… (+2 chars)  <seconds>
+  original   2/3  write_file(content='{"count":4,"total":61.5}', path='report.json… (+2 chars)  <seconds>
+  original   3/3  write_file(content='{"count":4,"total":61.5}', path='report.json… (+2 chars)  <seconds>
+  variant    1/3  write_file(content='{"amount_total":61.5,"row_count":4}', path='… (+13 chars)  <seconds>
+  variant    2/3  write_file(content='{"amount_total":61.5,"row_count":4}', path='… (+13 chars)  <seconds>
+  variant    3/3  write_file(content='{"amount_total":61.5,"row_count":4}', path='… (+13 chars)  <seconds>
+
+   behaviour                                                                original             variant              p adj.
+A  write_file(content='{"amount_total":61.5,"row_count":4}', … (+19 chars)  0/3   0% [0%-56%]    3/3 100% [44%-100%]  0.200 
+B  write_file(content='{"count":4,"total":61.5}', path='repor… (+8 chars)   3/3 100% [44%-100%]  0/3   0% [0%-56%]    0.200 
+p adj.: Fisher exact per behaviour, Bonferroni-corrected for 2 comparisons
+
+target (declared before sampling): behaviour matching /row_count/
+  original  0/3   0% [0%-56%]
+  variant   3/3 100% [44%-100%]
+  Fisher exact p = 0.100 → not significant at α=0.05
+  not the same as no effect: a difference this size would take ~3 samples per arm to detect reliably
+
+The 1 model-written message(s) before this step were generated under the original wording, and both arms inherit them. A checkpoint A/B is a fast screen; confirm a winner with full runs.
+experiments <experiment 2> (original) and <experiment 3> (variant) · <minutes>

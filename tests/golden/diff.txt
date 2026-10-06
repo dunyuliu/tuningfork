@@ -1,0 +1,5 @@
+ k     <run r0>  <run r2> 
+ 0     same      same     
+ 1  ≠  left      right    
+
+first divergence at step 1

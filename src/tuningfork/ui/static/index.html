@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tuning Fork</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M10 3v11a6 6 0 0 0 12 0V3M16 20v9' stroke='%235b6cff' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/guide" aria-label="Tuning Fork home">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M10 3v11a6 6 0 0 0 12 0V3M16 20v9" />
+      </svg>
+      <span>Tuning Fork</span>
+    </a>
+    <nav class="tabs" aria-label="Sections">
+      <a href="#/live" data-nav="live" hidden>Live <span id="held-count" class="badge" hidden></span></a>
+      <a href="#/runs" data-nav="runs">Runs</a>
+      <a href="#/experiments" data-nav="experiments">Experiments</a>
+      <a href="#/refine" data-nav="refine">Refine</a>
+      <a href="#/skills" data-nav="skills">Skills</a>
+      <a href="#/scenarios" data-nav="scenarios">Scenarios</a>
+      <a href="#/jobs" data-nav="jobs">Jobs <span id="jobs-count" class="badge" hidden></span></a>
+      <a href="#/connections" data-nav="connections" hidden>Connections</a>
+      <a href="#/trash" data-nav="trash">Trash</a>
+      <a href="#/guide" data-nav="guide">Guide</a>
+    </nav>
+    <div class="topbar-end">
+      <div id="status" class="status" aria-live="polite"></div>
+      <button id="theme" class="icon-btn" type="button" title="Theme"></button>
+    </div>
+  </header>
+  <div id="token-banner" class="token-banner" hidden></div>
+  <div id="paused-banner" class="paused-banner" hidden>
+    Paused — model calls are refused until you resume. Calls already held stay held.
+  </div>
+  <main id="main"></main>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,253 @@
+"""The sandbox: every launch sees the same home and folder (`tuningfork.sandbox`).
+
+What a launch sees is what the model reads: in folders of its own, each run's prompt named a
+different path, and a few digits of it decided whether the model wrote a file or only said it
+did. The first tests build the sandbox's command without running it; the
+rest run bubblewrap itself, and are skipped where it cannot run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import tuningfork.sandbox
+from tuningfork.harness.base import LaunchSpec
+from tuningfork.ops import OperationError
+from tuningfork.runner import BatchRunner, layout_setting
+from tuningfork.sandbox import (
+    HOME,
+    SWITCH,
+    TMP,
+    WORKSPACE,
+    Sandbox,
+    for_launches,
+    hideable,
+    home_conflict,
+    status,
+    translate,
+)
+from tests.helpers import FakeAgent, task_stack
+
+#: A folder of this checkout, for the tests that run bubblewrap: outside /tmp there.
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+@pytest.fixture
+def sandboxed(monkeypatch):
+    """The sandbox on, as it is by default — skipped where bubblewrap cannot run, and where
+    this checkout or its Python is under /tmp, which every launch sees empty."""
+    monkeypatch.delenv(SWITCH, raising=False)
+    found = status()
+    if not found.available:
+        pytest.skip(f"no sandbox here: {found.reason}")
+    for needed in (Path(sys.executable), Path(__file__)):
+        if TMP in needed.parents:
+            pytest.skip(f"{needed} is under {TMP}, which every sandboxed launch sees empty")
+    return found
+
+
+@pytest.fixture
+def elsewhere(monkeypatch):
+    """The sandbox's /tmp moved where nothing is, so folders a test makes — under pytest's
+    own temporary folder, often in /tmp — count as the machine's, wherever the suite runs."""
+    monkeypatch.setattr(tuningfork.sandbox, "TMP", Path("/nowhere-tmp"))
+
+
+def folders(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "recordings" / "batches" / "ab12cd34" / "0"
+    (root / "home").mkdir(parents=True)
+    (root / "workspace").mkdir()
+    return root / "home", root / "workspace"
+
+
+class TestTheCommand:
+    def test_paths_to_a_launchs_folders_are_written_as_it_sees_them(self):
+        mounts = [(Path("/data/rec/batches/ab12cd34/0/workspace"), WORKSPACE),
+                  (Path("/data/rec/batches/ab12cd34/0/home"), HOME)]
+        assert translate("/data/rec/batches/ab12cd34/0/home/.hermes", mounts) == "/home/user/.hermes"
+        assert translate("cd /data/rec/batches/ab12cd34/0/workspace && ls", mounts) == "cd /home/user/project && ls"
+        # A longer name is another folder.
+        assert translate("/data/rec/batches/ab12cd34/0/homework", mounts) == "/data/rec/batches/ab12cd34/0/homework"
+
+    def test_the_harness_runs_in_bubblewrap_with_its_folders_seen_as_home_and_project(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/home/tester")))
+        home, workspace = folders(tmp_path)
+        spec = LaunchSpec(
+            argv=("hermes", "chat", "--settings", json.dumps({"exclude": f"{workspace}/CLAUDE.md"})),
+            env={"HOME": str(home), "HERMES_HOME": str(home / ".hermes"), "PATH": "/usr/bin"},
+            cwd=workspace,
+        )
+        wrapped = Sandbox("/usr/bin/bwrap", "0.11.1").wrap(spec, home=home, workspace=workspace)
+
+        argv = list(wrapped.argv)
+        assert argv[0] == "/usr/bin/bwrap"
+        assert {"--die-with-parent", "--unshare-pid"} <= set(argv)
+        assert argv[argv.index("--ro-bind"):argv.index("--ro-bind") + 3] == ["--ro-bind", "/", "/"]
+        # Every home hidden but the person's own, read-only: the harness and its tools live there.
+        assert ["--tmpfs", "/home", "--ro-bind", "/home/tester", "/home/tester"] == argv[argv.index("/home") - 1:argv.index("/home") + 4]
+        bound = argv.index("--bind")
+        assert argv[bound:bound + 6] == ["--bind", str(home.resolve()), "/home/user", "--bind", str(workspace.resolve()), "/home/user/project"]
+        command = argv[argv.index("--") + 1:]
+        assert command[:3] == ["hermes", "chat", "--settings"]
+        assert json.loads(command[3]) == {"exclude": "/home/user/project/CLAUDE.md"}
+        assert argv[argv.index("--chdir") + 1] == "/home/user/project"
+        assert wrapped.env["HOME"] == "/home/user" and wrapped.env["HERMES_HOME"] == "/home/user/.hermes"
+        assert wrapped.env["TMPDIR"] == "/tmp" and wrapped.env["PWD"] == "/home/user/project"
+
+    def test_only_folders_a_launch_could_read_are_hidden(self, tmp_path, monkeypatch):
+        person = tmp_path / "person"
+        checkout = person / "tuningfork"  # the checkout sits in the person's home, as a clone does
+        fixtures, temporary = checkout / "tests" / "fixtures", tmp_path / "tmp"
+        for folder in (fixtures / "formats", temporary):
+            folder.mkdir(parents=True)
+        monkeypatch.setattr(tuningfork.sandbox, "TMP", temporary)
+        found = hideable([checkout, fixtures, temporary], real_home=person)
+        assert found == [checkout]  # inside another hidden, and hidden anyway, are left out
+        # Never the folder that holds the harness's program, nor one holding the home itself.
+        assert hideable([checkout], real_home=person, keep=[fixtures / "formats"]) == []
+        assert hideable([person], real_home=person) == []
+
+    def test_the_hidden_folders_leave_the_harnesss_path(self, tmp_path, monkeypatch, elsewhere):
+        person = tmp_path / "person"
+        checkout = person / "tuningfork"
+        (checkout / "bin").mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: person))
+        home, workspace = folders(tmp_path)
+        spec = LaunchSpec(argv=("/usr/bin/true",), env={"PATH": f"{checkout}/bin:/usr/bin"}, cwd=workspace)
+        wrapped = Sandbox("/usr/bin/bwrap", None, hide=(checkout,)).wrap(spec, home=home, workspace=workspace)
+        assert wrapped.env["PATH"] == "/usr/bin"
+        assert ["--tmpfs", str(checkout)] == list(wrapped.argv[wrapped.argv.index(str(checkout)) - 1:][:2])
+
+    def test_a_harness_under_tmp_is_refused_with_the_reason(self, tmp_path, monkeypatch):
+        """Found when a checkout cloned under /tmp failed every sandboxed run with bubblewrap's
+        "execvp …: No such file or directory", which named no cause."""
+        monkeypatch.setattr(tuningfork.sandbox, "TMP", tmp_path)
+        home, workspace = folders(tmp_path)
+        venv = tmp_path / "clone" / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        (venv / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+        (venv / "python").chmod(0o755)
+        for argv0, path in ((str(venv / "python"), "/usr/bin"), ("python", f"{venv}:/usr/bin")):
+            spec = LaunchSpec(argv=(argv0, "agent.py"), env={"PATH": path}, cwd=workspace)
+            with pytest.raises(OperationError) as refused:
+                Sandbox("/usr/bin/bwrap", None).wrap(spec, home=home, workspace=workspace)
+            assert refused.value.code == "sandbox_tmp" and str(venv / "python") in str(refused.value)
+            assert "TUNINGFORK_SANDBOX=off" in refused.value.hint
+
+    def test_a_person_whose_home_is_where_a_launchs_goes_runs_without_it(self):
+        assert home_conflict("/home/user") and home_conflict("/home/user/x") and home_conflict("/home")
+        assert home_conflict("/home/someone") is None
+
+    def test_turned_off_it_says_so(self, monkeypatch):
+        monkeypatch.setenv(SWITCH, "off")
+        assert not status().available and SWITCH in status().reason
+        sandbox, why = for_launches([])
+        assert sandbox is None and SWITCH in why
+
+    def test_a_launch_keeps_the_sandbox_it_ran_in(self):
+        kept = layout_setting(FakeAgent(), Sandbox("/usr/bin/bwrap", "0.11.1"))
+        assert kept["sandbox"] == {"kind": "bubblewrap", "version": "0.11.1", "home": "/home/user", "workspace": "/home/user/project"}
+        assert "sandbox" not in layout_setting(FakeAgent())
+
+
+class TestTheBatchPlan:
+    @pytest.fixture
+    def stack(self, tmp_path, mock_server, monkeypatch):
+        with task_stack(tmp_path, mock_server, monkeypatch) as built:
+            built.spec.path.write_text(json.dumps(built.spec.to_dict()), encoding="utf-8")
+            yield built
+
+    def prepare(self, stack):
+        from tuningfork.ops.batch import prepare_batch
+
+        return prepare_batch(
+            stack.store, stack.spec.path, base_url=f"{stack.url}/v1", workdir=stack.tmp / "batches",
+            model="m", harness="fake", n=1,
+        )
+
+    def test_it_says_what_every_run_sees(self, stack, monkeypatch):
+        import tuningfork.sandbox
+
+        monkeypatch.setattr(tuningfork.sandbox, "for_launches", lambda hide: (Sandbox("/usr/bin/bwrap", "0.11.1"), None))
+        data = self.prepare(stack).to_json()
+        assert data["sandbox"]["workspace"] == "/home/user/project" and data["notes"] == []
+
+    def test_without_it_a_warning_says_why_and_what_changes(self, stack, monkeypatch):
+        import tuningfork.sandbox
+
+        monkeypatch.delenv(SWITCH, raising=False)
+        monkeypatch.setattr(tuningfork.sandbox, "for_launches", lambda hide: (None, "bubblewrap is not installed"))
+        data = self.prepare(stack).to_json()
+        assert data["sandbox"] is None
+        (note,) = data["notes"]
+        assert note["level"] == "warning" and "bubblewrap is not installed" in note["message"]
+        assert "differ from run to run" in note["message"]
+
+
+class TestInBubblewrap:
+    def test_a_launch_sees_its_home_and_project_and_nothing_hidden(self, sandboxed, tmp_path):
+        home, workspace = folders(tmp_path)
+        script = (
+            "import json, os\n"
+            "open('made.txt', 'w').write('x')\n"
+            "open(os.path.expanduser('~/note.txt'), 'w').write('y')\n"
+            f"print(json.dumps({{'cwd': os.getcwd(), 'home': os.environ['HOME'], "
+            f"'hidden': os.listdir({str(FIXTURES)!r}), 'real_home_writable': os.access({str(Path.home())!r}, os.W_OK), "
+            "'pids': sum(name.isdigit() for name in os.listdir('/proc'))}))\n"
+        )
+        spec = LaunchSpec(argv=(sys.executable, "-c", script), env={"PATH": os.environ.get("PATH", "")}, cwd=workspace)
+        wrapped = Sandbox(sandboxed.executable, sandboxed.version, hide=(FIXTURES,)).wrap(spec, home=home, workspace=workspace)
+        done = subprocess.run(list(wrapped.argv), env=wrapped.env, cwd=wrapped.cwd, capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+        seen = json.loads(done.stdout)
+        assert seen["cwd"] == "/home/user/project" and seen["home"] == "/home/user"
+        if hideable([FIXTURES], real_home=Path.home()):
+            assert seen["hidden"] == []  # empty inside, untouched outside
+            assert (FIXTURES / "formats").is_dir()
+        assert seen["real_home_writable"] is False
+        assert seen["pids"] < 10  # its own processes only
+        # What it wrote is in the launch's own folders, where tuningfork snapshots and checks it.
+        assert (workspace / "made.txt").read_text() == "x" and (home / "note.txt").read_text() == "y"
+
+    def test_runs_of_a_batch_ask_the_same_thing_and_are_judged_as_before(self, sandboxed, tmp_path, mock_server, monkeypatch):
+        with task_stack(tmp_path, mock_server, monkeypatch) as stack:
+            sandbox, _ = for_launches([stack.store.home, stack.tmp / "batches"])
+            runner = BatchRunner(
+                stack.store, FakeAgent(), base_url=f"{stack.url}/v1", model="m",
+                workdir=stack.tmp / "batches", settle=0.1, sandbox=sandbox,
+            )
+            outcomes = runner.run(stack.spec, stack.item, 2).outcomes
+            # Judged as ever: the original wording's report has the wrong keys, and the check,
+            # run outside the sandbox, found it where the harness wrote it.
+            assert [(outcome.usable, outcome.passed) for outcome in outcomes] == [(True, False)] * 2, outcomes[0].stderr
+            launch = stack.store.get_launch(stack.store.get_run(outcomes[0].run_id).launch_id)
+            assert json.loads((Path(launch.workspace) / "report.json").read_text()) == {"count": 4, "total": 61.5}
+            requests = [stack.store.harness_request(stack.store.steps(outcome.run_id)[0]) for outcome in outcomes]
+            assert "Working directory: /home/user/project" in requests[0]["messages"][0]["content"]
+            assert requests[0] == requests[1]  # nothing in the prompt tells one run from another
+            assert launch.settings["sandbox"]["workspace"] == "/home/user/project"
+            assert (Path(launch.home) / "project").is_dir()  # the mount point, made by tuningfork
+
+    def test_a_fork_runs_where_its_source_ran_or_not_at_all(self, sandboxed, tmp_path, mock_server, monkeypatch):
+        with task_stack(tmp_path, mock_server, monkeypatch) as stack:
+            sandbox, _ = for_launches([stack.store.home, stack.tmp / "batches"])
+            runner = BatchRunner(
+                stack.store, FakeAgent(), base_url=f"{stack.url}/v1", model="m",
+                workdir=stack.tmp / "batches", settle=0.1, sandbox=sandbox,
+            )
+            (source,) = runner.run(stack.spec, stack.item, 1).outcomes
+            plan, (fork,) = stack.fork(source.run_id, "write_file")
+            assert plan.sandbox is not None
+            # The same paths as its source: every recorded call replayed, and live from the step.
+            assert fork.usable and fork.departed is None and fork.reached
+            assert fork.live_outcome["label"].startswith("write_file(")
+            monkeypatch.setenv(SWITCH, "off")
+            with pytest.raises(OperationError) as refused:
+                stack.fork(source.run_id, "write_file")
+            assert refused.value.code == "no_sandbox"

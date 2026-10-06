@@ -1,0 +1,31 @@
+run <run pilot>  pilot
+  task tally-report/1 · model mock-model · 2 steps · started <when>
+
+  [0] system: You are an agent.  [IMPORTANT: The user launched this CLI session with the "tally-report" skill prel…
+      You are an agent.
+
+[IMPORTANT: The user launched this CLI session with the "tally-report" skill preloaded.]
+
+---
+name: tally-report
+---
+
+# Tally report
+
+Write the totals to report.json.
+
+[Skill directory: /tmp/run/home/skills/tally-report]
+
+      skill tally-report · no recorded file matches
+  [1] user: Use the tally-report skill on data.csv.
+      Use the tally-report skill on data.csv.
+step 0 · read_file(path='data.csv') · tool_calls · 1 experiment
+      tool call  read_file({"path": "data.csv"})
+  [3] tool: id,amount 1,10
+      id,amount
+1,10
+
+step 1 · write_file(path='report.json') · stop · 2 experiments
+      tool call  write_file({"path": "report.json"})
+
+[n] is a message's place in the last step's context; `tuningfork step <run> <k>` shows exactly what a step was sent.

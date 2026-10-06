@@ -1,0 +1,69 @@
+// The HTTP API the CLI also uses. The UI holds no capability the command line lacks.
+//
+// Every request goes through here, and only here: this is the one place the access token
+// is attached, so no other module ever handles it.
+
+import { auth, refused } from "./auth.js";
+
+const BASE = "/_tuningfork/api";
+const TOKEN_HEADER = "x-tuningfork-token";
+
+export class ApiError extends Error {
+  constructor(message, status, error = {}) {
+    super(message);
+    this.status = status;
+    this.code = error.code || null;
+    this.hint = error.hint || null;
+    this.detail = error.detail || null;
+    this.field = error.field || null;
+  }
+}
+
+async function call(method, path, body, { raw = false, contentType } = {}) {
+  const init = { method, headers: { accept: "application/json" } };
+  if (auth.token) init.headers[TOKEN_HEADER] = auth.token;
+  if (body !== undefined) {
+    init.headers["content-type"] = raw ? contentType || "application/octet-stream" : "application/json";
+    init.body = raw ? body : JSON.stringify(body);
+  }
+  let response;
+  try {
+    response = await fetch(BASE + path, init);
+  } catch {
+    throw new ApiError("tuningfork is not answering — has the server stopped?", 0);
+  }
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (!response.ok) {
+    const error = data?.error || {};
+    if (error.code === "token_missing" || error.code === "token_wrong") refused();
+    throw new ApiError(error.message || `HTTP ${response.status}`, response.status, error);
+  }
+  return data;
+}
+
+export const api = {
+  get: (path) => call("GET", path),
+  post: (path, body = {}) => call("POST", path, body),
+  patch: (path, body) => call("PATCH", path, body),
+  del: (path) => call("DELETE", path),
+  /** Raw bytes — a file as it is — rather than JSON. */
+  put: (path, bytes, contentType) => call("PUT", path, bytes, { raw: true, contentType }),
+};
+
+export const enc = encodeURIComponent;
+
+export function query(params) {
+  const entries = Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  const text = new URLSearchParams(entries).toString();
+  return text ? `?${text}` : "";
+}
+
+export const EVENTS_URL = `${BASE}/events`;

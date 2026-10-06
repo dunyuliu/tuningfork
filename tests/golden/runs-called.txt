@@ -1,0 +1,4 @@
+ run       label  task            steps  model       started      check 
+ <run pilot>  pilot  tally-report/1  2      mock-model  <when>  -     
+
+4 run(s), 8 step(s), 7 unique message(s) in <tmp>/store

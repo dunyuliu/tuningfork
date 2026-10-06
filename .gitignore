@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local notes and settings, never committed: CLAUDE.local.md, a probe's *.local.json
+*.local.md
+*.local.json
+
+# Local recording state
+*.db
+*.db-wal
+*.db-shm
+.tuningfork/

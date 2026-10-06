@@ -1,0 +1,33 @@
+run <run pilot> step 1
+  model   mock-model
+  params  {}
+  server  {"n_ctx": 65536, "temperature": 1.0, "top_p": 0.95}
+  timings {}
+
+context
+  [0] system: You are an agent.  [IMPORTANT: The user launched this CLI session with the "tally-report" skill prel…
+      You are an agent.
+
+[IMPORTANT: The user launched this CLI session with the "tally-report" skill preloaded.]
+
+---
+name: tally-report
+---
+
+# Tally report
+
+Write the totals to report.json.
+
+[Skill directory: /tmp/run/home/skills/tally-report]
+
+  [1] user: Use the tally-report skill on data.csv.
+      Use the tally-report skill on data.csv.
+  [2] assistant: tool_calls(read_file)
+      
+  [3] tool: id,amount 1,10
+      id,amount
+1,10
+
+
+response
+  tool_call write_file({"path": "report.json"})

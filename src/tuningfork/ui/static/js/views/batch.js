@@ -1,0 +1,141 @@
+// Run a task N times through its harness: a batch, started from the browser.
+//
+// A task's check is a shell command from its spec, run in every run's workspace — shown
+// whole, always, before anything starts — or a check of the final reply, said in words.
+
+import { api, enc } from "../api.js";
+import { command, crumbs, h, kv, loading, longText, panel, plural, replace } from "../dom.js";
+import { field, input, numberOf, planForm, textOf } from "../forms.js";
+import { live } from "../live.js";
+
+const HARNESSES = ["hermes", "claude-code"];
+
+export async function batchView(root, _, scope) {
+  replace(root, loading());
+  const query = scope.query || new URLSearchParams();
+  const prefill = {
+    spec: query.get("spec") || "", scenario: query.get("scenario") || "", eval: query.get("eval") || "",
+    harness: query.get("harness") || "hermes", model: query.get("model") || "", from: null,
+  };
+  if (query.get("run")) {
+    const detail = await api.get(`/runs/${enc(query.get("run"))}`);
+    const launch = detail.launch || {};
+    Object.assign(prefill, {
+      spec: launch.spec_path || prefill.spec,
+      eval: launch.eval_id ? String(launch.eval_id) : prefill.eval,
+      harness: launch.harness || detail.run.harness || "hermes",
+      model: launch.model || detail.run.model || "",
+      from: detail.run,
+    });
+  }
+
+  const head = h("div", { class: "page-head" }, h("div", null, h("h1", null, "Run a task"),
+    h("p", { class: "sub" }, "Each run gets a fresh workspace and home, with the skill frozen for the whole batch.")));
+  if (live.mode !== "live") {
+    replace(root, crumbs([["Runs", "#/runs"], ["run a task"]]), head,
+      panel("From a terminal", h("div", { class: "stack", style: { gap: "8px" } },
+        h("p", { class: "hint" }, "Starting runs needs a running proxy (tuningfork serve). Or:"),
+        command(`tuningfork batch ${prefill.spec || "<evals.json>"} -n 5 --harness ${prefill.harness}`))));
+    return;
+  }
+
+  const saved = await api.get("/variants");
+  const harnesses = HARNESSES.includes(prefill.harness) ? HARNESSES : [...HARNESSES, prefill.harness];
+  const scenarios = await api.get("/scenarios");
+  // Which of the spec's tasks (its "evals") to run: offered by what each asks once the plan
+  // has read the spec, and back to its first whenever another spec is chosen.
+  const task = h("select", { class: "field", name: "eval" },
+    h("option", { value: prefill.eval || "" }, prefill.eval ? `task ${prefill.eval}` : "its first task"));
+  const anotherSpec = () => replace(task, h("option", { value: "" }, "its first task"));
+  const offerTasks = (plan) => {
+    const evals = plan.evals || [];
+    const before = task.value;
+    replace(task, evals.map((item) => h("option", { value: item.id, selected: item.id === plan.eval },
+      `${item.id} — ${item.prompt.length > 90 ? `${item.prompt.slice(0, 90)}…` : item.prompt}`)));
+    task.disabled = evals.length < 2;
+    // The plan was made for what the form said; once it names the task, the form says so
+    // too, and is planned once more — or Start would wait on a plan that never comes.
+    if (task.value !== before) task.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const fields = [
+    prefill.from ? h("p", { class: "hint" }, "As ", h("a", { class: "mono", href: `#/runs/${prefill.from.id}` }, `run ${prefill.from.id.slice(0, 8)}`), " was launched.") : null,
+    h("div", { class: "form-grid" },
+      field("Scenario", h("select", { class: "field", name: "scenario", onchange: anotherSpec },
+        h("option", { value: "" }, "— a spec by its path instead —"),
+        scenarios.map((scenario) => h("option", { value: scenario.name, selected: scenario.name === prefill.scenario }, scenario.name))),
+        { help: "A task kept in the recordings folder." }),
+      field("Task spec", input("spec", { value: prefill.spec, placeholder: "/path/to/evals.json", oninput: anotherSpec }), { help: "Or an evals.json on the proxy's machine.", wide: true }),
+      field("Task in the spec", task, { help: "A spec can hold several tasks (its evals). Each run does this one.", wide: true }),
+      field("Runs", input("n", { type: "number", value: 5, min: 1, max: 200 })),
+      field("Harness", h("select", { class: "field", name: "harness" },
+        harnesses.map((name) => h("option", { value: name, selected: name === prefill.harness }, name)))),
+      field("Model", input("model", { value: prefill.model, placeholder: "the one the server lists" })),
+      field("Skill", h("select", { class: "field", name: "skill_file" },
+        h("option", { value: "" }, "the spec's own"),
+        saved.map((variant) => h("option", { value: variant.path }, `${variant.skill}/${variant.name} (saved variant)`))),
+        { help: "A saved variant replaces the skill's SKILL.md in every run: confirming a wording with full runs." }),
+      field("At once", input("concurrency", { type: "number", value: 1, min: 1, max: 16 }), { help: "On one GPU, 1 is fastest." })),
+  ];
+  const { element } = planForm({
+    kind: "batch",
+    fields,
+    read: (form) => {
+      const scenario = textOf(form, "scenario");
+      const spec = textOf(form, "spec").trim();
+      if (!scenario && !spec) throw Object.assign(new Error("Choose a scenario, or name a task spec."), { field: "scenario" });
+      const params = {
+        ...(scenario ? { scenario } : { spec }),
+        n: numberOf(form, "n") ?? 5,
+        harness: textOf(form, "harness"),
+        concurrency: numberOf(form, "concurrency") ?? 1,
+      };
+      const evalId = textOf(form, "eval").trim();
+      if (evalId) params.eval = evalId;
+      const model = textOf(form, "model").trim();
+      if (model) params.model = model;
+      const skill = textOf(form, "skill_file");
+      if (skill) params.skill_file = skill;
+      return params;
+    },
+    render: (plan) => {
+      offerTasks(plan);
+      return batchPreview(plan);
+    },
+    startLabel: "Start the runs",
+    onStarted: (job) => (location.hash = `#/jobs/${job.id}`),
+  });
+  replace(root, crumbs([["Runs", "#/runs"], ["run a task"]]), head, panel("The task", element, { className: "start-panel" }));
+}
+
+function batchPreview(plan) {
+  return h("div", { class: "stack", style: { gap: "8px" } },
+    // How a run passes, first: what every number this batch produces will mean.
+    h("div", { class: "check-command" },
+      plan.check_kind === "shell"
+        ? [
+            h("div", { class: "label" }, "How a run passes — this runs as a shell command, as you, in each run's workspace, where the harness worked. $TUNINGFORK_REPLY names a file holding the agent's final reply."),
+            h("pre", { class: "code" }, plan.check),
+          ]
+        : plan.check_kind
+          ? [h("div", { class: "label" }, "How a run passes — judged by tuningfork on each run's final reply"), h("p", null, plan.check_text)]
+          : [h("div", { class: "label" }, "How a run passes"), h("p", { class: "muted" }, "No check: runs will have no verdict.")]),
+    h("div", null, h("div", { class: "label" }, "What each run is asked"), longText(plan.prompt, { limit: 600, lines: 8 })),
+    kv([
+      ["task", h("span", { class: "mono" }, plan.task_id)],
+      ["spec", plan.spec ? h("span", { class: "mono" }, plan.spec) : null],
+      ["runs", `${plural(plan.n, "run")} of ${plan.harness}, ${plan.concurrency} at a time`],
+      ["model", h("span", { class: "mono" }, plan.model)],
+      ["skill", plan.skill_file
+        ? h("span", null, h("span", { class: "mono" }, plan.skill_dir || "—"), ", its SKILL.md replaced by ", h("span", { class: "mono" }, plan.skill_file))
+        : plan.skill_dir ? h("span", { class: "mono" }, plan.skill_dir) : "none named"],
+      ["where", plan.workdir
+        ? h("span", null, "each run in a fresh folder under ", h("span", { class: "mono" }, plan.workdir), ", its workspace holding the eval's input files")
+        : "—"],
+      // What the harness sees, which is what the model reads: the same home and folder in
+      // every run, or each run's own folders when there is no sandbox (a note says why).
+      ["sees", plan.sandbox
+        ? h("span", null, "in a sandbox, every run works in ", h("span", { class: "mono" }, plan.sandbox.workspace), ", its home ", h("span", { class: "mono" }, plan.sandbox.home))
+        : "its own folders"],
+    ]),
+    (plan.notes || []).map((note) => h("div", { class: ["banner", note.level === "warning" ? "banner-warn" : ""] }, note.message)));
+}

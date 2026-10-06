@@ -1,0 +1,16 @@
+run <run pilot> step 0 — 4 samples from http://upstream.test
+  context   2 messages, after user: Use the tally-report skill on data.csv.
+  sampling  the recorded conditions (the request's own parameters, else server defaults)
+  budget    max_tokens 4096, concurrency 1
+
+    1/4  read_file(path='data.csv')  <seconds>
+    2/4  read_file(path='data.csv')  <seconds>
+    3/4  read_file(path='data.csv')  <seconds>
+    4/4  I will ask first.  <seconds>
+
+step 0, after user: Use the tally-report skill on data.csv. — 4 samples
+   count  rate  95% CI     behaviour                 
+A  3/4    75%   [30%-95%]  read_file(path='data.csv')
+B  1/4    25%   [5%-70%]   I will ask first.         
+
+experiment <experiment 1> · <minutes> · <seconds> per sample · use `tuningfork ab <run pilot> 0 --target <letter> --variant <file>` to test a wording change

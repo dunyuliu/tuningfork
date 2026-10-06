@@ -1,0 +1,11 @@
+resample at run <run pilot> step 0 — after user: Use the tally-report skill on data.csv.
+  sent stream=None (recorded: True)
+  sent stream_options=None (recorded: {'include_usage': True})
+  sent max_tokens=4096 (recorded: 65536)
+  sent cache_prompt=False (recorded: None)
+  re-analysed under: tool_name
+
+step 0 — 4 samples
+   count  rate  95% CI     behaviour        
+A  3/4    75%   [30%-95%]  read_file(…)     
+B  1/4    25%   [5%-70%]   I will ask first.

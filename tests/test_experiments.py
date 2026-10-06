@@ -1,0 +1,543 @@
+"""Resampling and wording A/B tests from a recorded checkpoint.
+
+Everything runs against the mock server. The A/B test uses a mock whose answer depends on
+the skill text it was sent, so a correct substitution produces a real, detectable shift —
+and a broken one would not.
+"""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from tuningfork.analysis.distribution import compare_arms, distribution, target_by_pattern
+from tuningfork.analysis.normalize import NORMALIZER_VERSION
+from tuningfork.experiment import (
+    EXPERIMENT_HEADER,
+    CheckpointError,
+    NothingToCompare,
+    SamplingPlan,
+    SkillNotFound,
+    declared_target,
+    experiment_outcomes,
+    history_caveat,
+    load_checkpoint,
+    prepare_request,
+    resolve_target,
+    run_ab,
+    run_resample,
+)
+from tuningfork.analysis.tokens import TokenStream
+from tests.helpers import PROPS, SKILL, VARIANT, as_response, record_pilot, text_message
+from tests.mock_server import MockTurn
+
+UPSTREAM = "http://upstream.test"
+
+
+def write(keys: dict) -> MockTurn:
+    return MockTurn(
+        tool_calls=[
+            {"name": "write_file", "arguments": {"path": "report.json", "content": json.dumps(keys)}}
+        ]
+    )
+
+
+@pytest.fixture
+async def client(mock_server):
+    mock_server.props = PROPS
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=mock_server.app)) as http:
+        yield http
+
+
+class TestPrepareRequest:
+    RECORDED = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 65536,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    def test_drops_streaming_and_caps_the_generation(self):
+        sent, changes = prepare_request(self.RECORDED, SamplingPlan(max_tokens=4096))
+
+        assert "stream" not in sent and "stream_options" not in sent
+        assert sent["max_tokens"] == 4096
+        assert changes["max_tokens"] == {"recorded": 65536, "sent": 4096}
+        assert changes["stream"]["recorded"] is True
+
+    def test_a_smaller_recorded_budget_is_kept(self):
+        sent, changes = prepare_request({**self.RECORDED, "max_tokens": 512}, SamplingPlan())
+        assert sent["max_tokens"] == 512
+        assert "max_tokens" not in changes
+
+    def test_overrides_are_applied_and_recorded(self):
+        sent, changes = prepare_request(
+            self.RECORDED, SamplingPlan(overrides={"temperature": 0.2})
+        )
+        assert sent["temperature"] == 0.2
+        assert changes["temperature"] == {"recorded": None, "sent": 0.2}
+
+    def test_a_recorded_seed_is_replaced_and_noted(self):
+        sent, changes = prepare_request({**self.RECORDED, "seed": 42}, SamplingPlan())
+        assert "seed" not in sent
+        assert changes["seed"] == {"recorded": 42, "sent": "per sample"}
+
+    def test_the_recorded_request_is_not_mutated(self):
+        recorded = json.loads(json.dumps(self.RECORDED))
+        prepare_request(recorded, SamplingPlan(overrides={"temperature": 0.1}))
+        assert recorded == self.RECORDED
+
+    def test_invalid_plans_are_rejected(self):
+        with pytest.raises(ValueError):
+            SamplingPlan(n=0)
+        with pytest.raises(ValueError):
+            SamplingPlan(normalizers=["nonsense"])
+
+
+class TestCheckpoint:
+    def test_loads_and_describes_what_the_model_had_just_seen(self, store):
+        run_id = record_pilot(store)
+
+        checkpoint = load_checkpoint(store, run_id, 1)
+
+        assert checkpoint.describe() == "after the result of read_file"
+        assert checkpoint.generated_history == 1
+
+    def test_missing_step_is_a_clear_error(self, store):
+        run_id = record_pilot(store)
+        with pytest.raises(CheckpointError, match="steps 0-1"):
+            load_checkpoint(store, run_id, 7)
+
+    def test_caveat_distinguishes_a_clean_checkpoint(self, store):
+        run_id = record_pilot(store)
+        assert "identical context" in history_caveat(load_checkpoint(store, run_id, 0))
+        assert "fast screen" in history_caveat(load_checkpoint(store, run_id, 1))
+
+
+class TestResample:
+    async def test_samples_are_drawn_stored_and_clustered(self, store, mock_server, client):
+        exec_call = MockTurn(tool_calls=[{"name": "execute_code", "arguments": {"code": "x=1"}}])
+        mock_server.script(
+            *[MockTurn(tool_calls=[{"name": "read_file", "arguments": {"path": "data.csv"}}])] * 3,
+            exec_call,
+            exec_call,
+        )
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=5), base_url=UPSTREAM, client=client
+        )
+
+        result = distribution(experiment_outcomes(store, experiment))
+        assert [(c.letter, c.count) for c in result.clusters] == [("A", 3), ("B", 2)]
+        assert "read_file" in result.clusters[0].outcome.label
+        samples = store.samples(experiment.id)
+        # A random base, recorded with the experiment: each sample's seed is base + i.
+        base = experiment.settings["seed_base"]
+        assert isinstance(base, int) and [s.seed for s in samples] == [base + i for i in range(5)]
+
+    async def test_each_experiment_draws_new_seeds_unless_told_which(self, store, mock_server, client):
+        """The same seeds would draw the same samples wherever the server reproduces them, so
+        a second experiment would be no second sample."""
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+        drawn = [await run_resample(store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM, client=client)
+                 for _ in range(2)]
+        assert drawn[0].settings["seed_base"] != drawn[1].settings["seed_base"]
+
+        again = await run_resample(store, checkpoint, SamplingPlan(n=2, seed_base=drawn[0].settings["seed_base"]),
+                                   base_url=UPSTREAM, client=client)
+        assert [s.seed for s in store.samples(again.id)] == [s.seed for s in store.samples(drawn[0].id)]
+
+    async def test_each_prompt_is_processed_whole_on_llama_cpp(self, store, mock_server, client):
+        """A reused prompt cache made one request's behaviour depend on what the server ran
+        before: every sample is asked for its whole prompt, and it says so."""
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        fresh = await run_resample(store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM, client=client)
+        assert all(request.get("cache_prompt") is False for request in mock_server.requests[-2:])
+        assert fresh.changes["cache_prompt"] == {"recorded": None, "sent": False}
+
+        reused = await run_resample(store, checkpoint, SamplingPlan(n=2, prompt_cache=True), base_url=UPSTREAM, client=client)
+        assert all("cache_prompt" not in request for request in mock_server.requests[-2:])
+        assert "cache_prompt" not in reused.changes
+
+        # llama.cpp's Messages endpoint drops the field (measured on b11108): not sent, and said.
+        from tuningfork.wire import get_wire
+
+        wire = get_wire("anthropic-messages")
+        store.begin_run("cc", "t")
+        store.record_step(
+            request={"model": "m", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]},
+            response=as_response(text_message("ok")), wire=wire.name, normalize=wire.normalize_message,
+        )
+        messages = await run_resample(store, load_checkpoint(store, "cc", 0), SamplingPlan(n=1),
+                                      base_url=UPSTREAM, client=client)
+        assert "cache_prompt" not in mock_server.requests[-1] and "cache_prompt" not in messages.changes
+        # This server answers a repeated prompt from its cache (measured): said, with the cure.
+        assert any("drops cache_prompt" in note and "--no-cache-prompt" in note for note in messages.notes)
+
+        # Started with --no-cache-prompt, it processes every prompt whole: nothing to qualify.
+        import tuningfork.backends.llamacpp as llamacpp
+
+        async def never(*args, **kwargs):
+            return False
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(llamacpp, "reuses_prompts", never)
+            whole = await run_resample(store, load_checkpoint(store, "cc", 0), SamplingPlan(n=1),
+                                       base_url=UPSTREAM, client=client)
+        assert not any("cache" in note for note in whole.notes)
+
+        # Another server is not sent llama.cpp's field; the experiment says what that means.
+        mock_server.props = None
+        other = await run_resample(store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client)
+        assert "cache_prompt" not in mock_server.requests[-1] and "cache_prompt" not in other.changes
+        assert any("not llama.cpp's" in note for note in other.notes)
+
+    async def test_requests_are_non_streaming_capped_and_tagged(
+        self, store, mock_server, client
+    ):
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=3), base_url=UPSTREAM, client=client
+        )
+
+        for payload in mock_server.requests:
+            assert "stream" not in payload
+            assert payload["max_tokens"] == 4096
+            # History is held fixed: the messages are exactly the recorded ones.
+            assert payload["messages"] == checkpoint.request["messages"]
+        assert len({payload["seed"] for payload in mock_server.requests}) == 3
+        chat_headers = [h for method, path, h in mock_server.seen if path.endswith("/completions")]
+        assert all(h.get(EXPERIMENT_HEADER) == experiment.id for h in chat_headers)
+
+    async def test_transport_errors_are_reported_but_not_rated(
+        self, store, mock_server, client
+    ):
+        mock_server.script(MockTurn(content="ok"), MockTurn(status=500), MockTurn(content="ok"))
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=3), base_url=UPSTREAM, client=client
+        )
+
+        result = distribution(experiment_outcomes(store, experiment))
+        assert result.errors == 1
+        assert result.total == 2
+
+    @pytest.mark.parametrize("concurrency", [1, 2])
+    async def test_concurrency_is_bounded(self, store, mock_server, client, concurrency):
+        mock_server.script(*[MockTurn(content="x", stall=0.03)] * 6)
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        await run_resample(
+            store,
+            checkpoint,
+            SamplingPlan(n=6, concurrency=concurrency),
+            base_url=UPSTREAM,
+            client=client,
+        )
+
+        assert mock_server.peak_inflight <= concurrency
+
+    async def test_truncated_samples_are_their_own_outcome(self, store, mock_server, client):
+        mock_server.script(MockTurn(content="half a", finish_reason="length"))
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client
+        )
+
+        (outcome,) = experiment_outcomes(store, experiment)
+        assert outcome.kind == "truncated"
+
+
+class TestLogprobs:
+    """A resample can keep each sample's tokens, for a heatmap of where it wavered."""
+
+    @staticmethod
+    def entry(token_id: int, token: str, logprob: float = -0.01) -> dict:
+        piece = {"id": token_id, "token": token, "bytes": list(token.encode()), "logprob": logprob}
+        return {**piece, "top_logprobs": [piece, {"id": 99, "token": "x", "bytes": [120], "logprob": -5.0}]}
+
+    async def test_a_samples_tokens_are_kept_apart_from_its_response(self, store, mock_server, client):
+        mock_server.props = {**PROPS, "chat_template": "{{ '<|tool_call>call:' }}"}
+        entries = [
+            self.entry(100, "<|channel>"), self.entry(1, "thought"), self.entry(2, "\n"),
+            self.entry(3, "hm"), self.entry(101, "<channel|>"), self.entry(4, "abcdefghijklmnop"),
+            self.entry(50, ""),
+        ]
+        mock_server.script(MockTurn(content="abcdefghijklmnop", reasoning="hm", logprobs={"content": entries}))
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1, logprobs=5), base_url=UPSTREAM, client=client
+        )
+
+        sent = mock_server.requests[-1]
+        assert (sent["logprobs"], sent["top_logprobs"]) == (True, 5)
+        assert experiment.changes["top_logprobs"] == {"recorded": None, "sent": 5}
+        assert experiment.settings["format"] == "gemma4"
+        (sample,) = store.samples(experiment.id)
+        assert "logprobs" not in store.sample_response(sample)["choices"][0]
+        (record,) = store.token_streams(sample_ids=[sample.id])
+        assert (record.source, record.method, record.top_k) == ("sampled", "chat-logprobs", 5)
+        stream = TokenStream.from_json(store.token_stream_data(record))
+        assert stream.text() == "<|channel>thought\nhm<channel|>abcdefghijklmnop"
+        assert [kind for kind, _, _ in stream.parts] == ["marker", "reasoning", "marker", "content", "marker"]
+
+    async def test_without_logprobs_nothing_changes(self, store, mock_server, client):
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+        experiment = await run_resample(store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client)
+        assert "logprobs" not in mock_server.requests[-1]
+        assert store.token_streams(sample_ids=[s.id for s in store.samples(experiment.id)]) == []
+
+    def test_a_messages_step_has_no_logprobs_to_ask_for(self, store):
+        from tuningfork.ops.common import OperationError
+        from tuningfork.ops.experiments import prepare_resample
+        from tuningfork.wire import get_wire
+
+        wire = get_wire("anthropic-messages")
+        store.begin_run("cc", "t")
+        store.record_step(
+            request={"model": "m", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}]},
+            response=as_response(text_message("ok")), wire=wire.name, normalize=wire.normalize_message,
+        )
+        with pytest.raises(OperationError, match="no logprobs") as refused:
+            prepare_resample(store, "cc", "0", base_url=UPSTREAM, logprobs=5)
+        assert "--score" in refused.value.hint
+
+    def test_logprobs_are_bounded(self):
+        with pytest.raises(ValueError, match="logprobs"):
+            SamplingPlan(logprobs=0)
+        with pytest.raises(ValueError, match="logprobs"):
+            SamplingPlan(logprobs=21)
+
+
+class TestParity:
+    async def test_matching_defaults_raise_no_notes(self, store, client):
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client
+        )
+        assert experiment.notes == []
+        assert experiment.server_defaults["temperature"] == 1.0
+
+    async def test_a_changed_server_default_is_flagged(self, store, mock_server, client):
+        mock_server.props = {"default_generation_settings": {"params": {"temperature": 0.7}}}
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client
+        )
+
+        assert any("temperature is 0.7 now" in note for note in experiment.notes)
+
+    async def test_an_overridden_parameter_is_not_compared(self, store, mock_server, client):
+        mock_server.props = {"default_generation_settings": {"params": {"temperature": 0.7}}}
+        checkpoint = load_checkpoint(store, record_pilot(store), 0)
+
+        experiment = await run_resample(
+            store,
+            checkpoint,
+            SamplingPlan(n=1, overrides={"temperature": 1.0}),
+            base_url=UPSTREAM,
+            client=client,
+        )
+
+        assert not any("temperature" in note for note in experiment.notes)
+
+    async def test_unrecorded_defaults_are_admitted(self, store, client):
+        checkpoint = load_checkpoint(store, record_pilot(store, server_defaults={}), 0)
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client
+        )
+        assert any("not recorded" in note for note in experiment.notes)
+
+    async def test_a_different_model_is_flagged(self, store, client):
+        checkpoint = load_checkpoint(store, record_pilot(store, model="other-model"), 0)
+        experiment = await run_resample(
+            store, checkpoint, SamplingPlan(n=1), base_url=UPSTREAM, client=client
+        )
+        assert any("other-model" in note for note in experiment.notes)
+
+
+class TestAB:
+    @staticmethod
+    def wording_sensitive(payload: dict) -> MockTurn:
+        """A model that follows the key names only when the skill states them."""
+        if "row_count and amount_total" in payload["messages"][0]["content"]:
+            return write({"row_count": 4, "amount_total": 61.5})
+        return write({"count": 4, "total": 61.5})
+
+    async def test_a_real_wording_effect_is_detected(self, store, mock_server, client):
+        mock_server.responder = self.wording_sensitive
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+
+        ab = await run_ab(
+            store,
+            checkpoint,
+            SamplingPlan(n=10),
+            base_url=UPSTREAM,
+            original_text=SKILL,
+            variant_text=VARIANT,
+            client=client,
+        )
+        result = compare_arms(
+            experiment_outcomes(store, ab.original),
+            experiment_outcomes(store, ab.variant),
+            target=target_by_pattern("row_count"),
+        )
+
+        assert result.target.original.successes == 0
+        assert result.target.variant.successes == 10
+        assert result.target.significant
+
+    async def test_no_effect_is_not_reported_as_one(self, store, mock_server, client):
+        mock_server.responder = lambda payload: write({"count": 4, "total": 61.5})
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+
+        ab = await run_ab(
+            store, checkpoint, SamplingPlan(n=10), base_url=UPSTREAM,
+            original_text=SKILL, variant_text=VARIANT, client=client,
+        )
+        result = compare_arms(
+            experiment_outcomes(store, ab.original),
+            experiment_outcomes(store, ab.variant),
+            target=target_by_pattern("row_count"),
+        )
+
+        assert not result.target.significant
+
+    async def test_the_arms_differ_only_in_the_skill(self, store, mock_server, client):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+
+        await run_ab(
+            store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM,
+            original_text=SKILL, variant_text=VARIANT, client=client,
+        )
+
+        original, variant = mock_server.requests[0], mock_server.requests[-1]
+        assert SKILL in original["messages"][0]["content"]
+        assert VARIANT in variant["messages"][0]["content"]
+        assert SKILL not in variant["messages"][0]["content"]
+        assert original["messages"][1:] == variant["messages"][1:]
+        assert {k: v for k, v in original.items() if k not in ("messages", "seed")} == {
+            k: v for k, v in variant.items() if k not in ("messages", "seed")
+        }
+
+    async def test_the_arms_are_stored_as_one_group(self, store, client):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+
+        ab = await run_ab(
+            store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM,
+            original_text=SKILL, variant_text=VARIANT,
+            original_path="SKILL.md", variant_path="SKILL.v2.md", client=client,
+        )
+
+        group = store.experiment_group(ab.original.group_id)
+        assert [e.arm for e in group] == ["original", "variant"]
+        assert group[1].variant["variant_path"] == "SKILL.v2.md"
+        assert group[1].variant["spans"][0]["role"] == "system"
+
+    async def test_a_skill_that_is_not_in_the_context_fails_before_sampling(
+        self, store, mock_server, client
+    ):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+
+        with pytest.raises(SkillNotFound):
+            await run_ab(
+                store, checkpoint, SamplingPlan(n=5), base_url=UPSTREAM,
+                original_text="# A skill nobody loaded\n\nDo things.\n",
+                variant_text=VARIANT, client=client,
+            )
+
+        assert mock_server.requests == []  # nothing was spent on a doomed experiment
+
+
+class TestTargets:
+    async def test_a_letter_names_a_cluster_from_an_earlier_resample(
+        self, store, mock_server, client
+    ):
+        mock_server.script(write({"count": 4, "total": 61.5}), write({"count": 4, "total": 61.5}))
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+        await run_resample(
+            store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM, client=client
+        )
+
+        target, normalizers = resolve_target(store, checkpoint, letter="a")
+
+        assert "count" in target.description
+        assert normalizers == []
+
+    def test_a_letter_without_an_earlier_resample_is_refused(self, store):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+        with pytest.raises(CheckpointError, match="Run a resample first"):
+            resolve_target(store, checkpoint, letter="A")
+
+    def test_declaring_both_forms_is_refused(self, store):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+        with pytest.raises(ValueError):
+            resolve_target(store, checkpoint, letter="A", pattern="x")
+
+
+class TestStoredTargets:
+    """A target declared before sampling is re-tested only as it was declared."""
+
+    @staticmethod
+    def experiment(store, target: dict, **settings):
+        run_id = record_pilot(store)
+        return store.create_experiment(
+            kind="ab", arm="original", run_id=run_id, step_idx=1,
+            step_id=store.step(run_id, 1).id, request={"messages": []},
+            settings={"n": 2, "normalizers": [], "target": target, **settings},
+        )
+
+    def test_a_target_is_kept_under_its_own_normalizers(self, store):
+        found = self.experiment(store, {"kind": "pattern", "value": "row_count"},
+                                normalizer_version=NORMALIZER_VERSION)
+        target, why_not = declared_target(found)
+        assert target is not None and why_not is None
+        same = ["tool_call_json", "python_ast", "json_content"]
+        assert declared_target(found, same)[0] is not None
+
+    def test_a_pattern_is_not_carried_into_another_lens(self, store):
+        """Found in review: under tool_name, /row_count/ matched nothing in either arm, and
+        a 0/20 → 20/20 result re-reported as 'not significant'."""
+        found = self.experiment(store, {"kind": "pattern", "value": "row_count"})
+        target, why_not = declared_target(found, ["tool_name"])
+        assert target is None
+        assert "different lens" in why_not
+
+    def test_a_key_from_older_normalizers_is_not_re_tested(self, store):
+        found = self.experiment(store, {"kind": "key", "value": "k", "description": "A"})
+        target, why_not = declared_target(found)  # stored before versions were recorded
+        assert target is None
+        assert "changed since" in why_not
+
+    def test_new_experiments_record_the_normalizer_version(self):
+        assert SamplingPlan().as_settings()["normalizer_version"] == NORMALIZER_VERSION
+
+
+class TestNothingToCompareEndToEnd:
+    async def test_an_ab_that_would_compare_a_request_with_itself_draws_nothing(
+        self, store, mock_server, client
+    ):
+        checkpoint = load_checkpoint(store, record_pilot(store), 1)
+        with pytest.raises(NothingToCompare):
+            await run_ab(store, checkpoint, SamplingPlan(n=2), base_url=UPSTREAM,
+                         original_text=SKILL, variant_text=SKILL, client=client)
+        assert mock_server.requests == []
+
+
+def test_a_checkpoint_after_harness_bookkeeping_describes_what_came_before(store):
+    """Claude Code follows each tool result with a token budget as a system message; every
+    checkpoint read 'after system: <total_tokens>…'."""
+    run_id = record_pilot(store)
+    checkpoint = load_checkpoint(store, run_id, 1)
+    checkpoint.request["messages"].append({"role": "system", "content": "<total_tokens>9</total_tokens>"})
+    assert checkpoint.describe() == "after the result of read_file"

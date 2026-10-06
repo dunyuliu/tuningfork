@@ -1,0 +1,7 @@
+ run       label  task            steps  model       started      check 
+ <run r2>  r2     t/1             2      m           <when>  fail  
+ <run r1>  r1     t/1             2      m           <when>  pass  
+ <run r0>  r0     t/1             2      m           <when>  pass  
+ <run pilot>  pilot  tally-report/1  2      mock-model  <when>  -     
+
+4 run(s), 8 step(s), 7 unique message(s) in <tmp>/store

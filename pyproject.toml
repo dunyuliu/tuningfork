@@ -1,0 +1,73 @@
+[project]
+name = "tuningfork"
+dynamic = ["version"]
+description = "A step debugger and experiment lab for agent skills on local LLMs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Heyuan Huang" }]
+keywords = ["agents", "agent skills", "llm", "debugger", "evaluation", "llama.cpp", "mcp"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "starlette>=0.41",
+    "uvicorn>=0.32",
+    "httpx>=0.28",
+    "rich>=13.7",
+    "typer>=0.15",
+]
+
+[project.urls]
+Homepage = "https://github.com/hhuang91/tuningfork"
+Issues = "https://github.com/hhuang91/tuningfork/issues"
+Changelog = "https://github.com/hhuang91/tuningfork/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# `tuningfork mcp`: the operations as tools for an agent. Imported only there.
+mcp = ["mcp>=2.2,<3"]
+
+[project.scripts]
+tuningfork = "tuningfork.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "anyio>=4.6",
+    # The extra, so `uv sync --all-groups` installs what the MCP tests need.
+    "mcp>=2.2,<3",
+    # The design-md example's check reads YAML; its tests skip without it.
+    "pyyaml>=6",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/tuningfork/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tuningfork"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
+markers = [
+    "real_server: needs a real llama.cpp server named by TUNINGFORK_REAL_SERVER; skipped otherwise",
+]

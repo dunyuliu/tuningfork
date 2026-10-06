@@ -1,0 +1,7 @@
+run <run pilot>  pilot
+  task    tally-report/1
+  model   mock-model
+  started <when>
+ k  outcome                         finish      ms  tokens  think 
+ 0  read_file(path='data.csv')      tool_calls  -   -       -     
+ 1  write_file(path='report.json')  stop        -   -       -     

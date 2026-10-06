@@ -1,0 +1,43 @@
+{
+  "skill_name": "design-md",
+  "tuningfork": {"skill_dir": "design-md"},
+  "evals": [
+    {
+      "id": "1",
+      "prompt": "Use the design-md skill to write a DESIGN.md for our app, Tidewater: calm, coastal and trustworthy, deep navy text on an off-white background, a teal accent for buttons and links, and Inter for everything.",
+      "expected_output": "DESIGN.md in the project folder, as the skill's spec and linter would have it, with no component below WCAG AA contrast.",
+      "files": [
+        {"path": "README.md", "content": "# Tidewater\n\nThe Tidewater web app.\n"}
+      ],
+      "expectations": [
+        "DESIGN.md opens with YAML front matter holding a name and colors, each color a hex value or a reference to one",
+        "every token reference resolves, and no section appears twice or out of the canonical order",
+        "every component's text and background colors reach WCAG AA's 4.5:1"
+      ],
+      "tuningfork": {
+        "check": "uv run --quiet --no-project --with pyyaml python \"$TUNINGFORK_SPEC_DIR/checks/design.py\"",
+        "max_turns": 30,
+        "timeout": 900
+      }
+    },
+    {
+      "id": "2",
+      "prompt": "Use the design-md skill to write a DESIGN.md for our app, Skyline: airy, modern and optimistic, slate text on a white background, a sky blue accent for buttons and links, and Inter for everything.",
+      "expected_output": "DESIGN.md in the project folder, as the skill's spec and linter would have it, with no component below WCAG AA contrast.",
+      "files": [
+        {"path": "README.md", "content": "# Skyline\n\nThe Skyline web app.\n"}
+      ],
+      "expectations": [
+        "DESIGN.md opens with YAML front matter holding a name and colors, each color a hex value or a reference to one",
+        "every token reference resolves, and no section appears twice or out of the canonical order",
+        "every component's text and background colors reach WCAG AA's 4.5:1"
+      ],
+      "tuningfork": {
+        "check": "uv run --quiet --no-project --with pyyaml python \"$TUNINGFORK_SPEC_DIR/checks/design.py\"",
+        "held_out": true,
+        "max_turns": 30,
+        "timeout": 900
+      }
+    }
+  ]
+}

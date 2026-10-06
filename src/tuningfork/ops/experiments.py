@@ -1,0 +1,620 @@
+"""Sampling a recorded step: resample it, or A/B a wording change at it.
+
+Each comes as `prepare_*`, which checks everything a person should see before any sample is
+drawn and has no side effects, and `execute_*`, which draws the samples. A front end shows
+the prepared plan, then runs it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from tuningfork.ops.common import Cancel, Cancelled, OperationError, Progress
+from tuningfork.ops.trash import refuse_trashed
+from tuningfork.store.db import Run, Step, Store
+
+
+def default_upstream() -> str:
+    """Where experiments sample from: the inference server itself, not the proxy."""
+    return os.environ.get("TUNINGFORK_UPSTREAM", "http://127.0.0.1:8081")
+
+
+def resolve_run(store: Store, reference: str) -> Run:
+    run = store.get_run(reference)
+    if run is None:
+        raise OperationError(f"no run matching {reference!r}")
+    return run
+
+
+def tools_called(store: Store, step: Step) -> list[str]:
+    """The tools the model called at `step`, in the order it called them."""
+    message = ((store.response(step) or {}).get("choices") or [{}])[0].get("message") or {}
+    return [(call.get("function") or {}).get("name") for call in message.get("tool_calls") or []]
+
+
+def first_call(store: Store, run: Run, tool: str) -> int | None:
+    """The first step of `run` whose model called `tool`, if any."""
+    for step in store.steps(run.id):
+        if tool in tools_called(store, step):
+            return step.idx
+    return None
+
+
+def step_index(store: Store, run: Run, reference: str) -> int:
+    """A step of `run` by its index, or as the first step whose model called that tool.
+
+    "The write" is how a person thinks of a step; its number depends on the path the run
+    took — a run that listed the directory first writes a step later.
+    """
+    if reference.isdigit():
+        return int(reference)
+    found = first_call(store, run, reference)
+    if found is None:
+        raise OperationError(
+            f"run {run.id[:8]} has no step where the model called {reference}",
+            hint=f"`tuningfork runs --called {reference}` lists runs that do",
+        )
+    return found
+
+
+def recorded_skill_file(run: Run) -> Path | None:
+    """The SKILL.md a batch run was given: the batch's frozen copy, if it still exists."""
+    folder = run.parity.get("skill_snapshot_dir")
+    candidate = Path(folder) / "SKILL.md" if folder else None
+    return candidate if candidate and candidate.is_file() else None
+
+
+def make_plan(
+    *,
+    n: int = 20,
+    concurrency: int = 1,
+    max_tokens: int = 4096,
+    seed_base: int | None = None,
+    prompt_cache: bool = False,
+    normalizers: Sequence[str] = (),
+    overrides: dict[str, Any] | None = None,
+    logprobs: int | None = None,
+):
+    from tuningfork.experiment import SamplingPlan
+
+    try:
+        return SamplingPlan(
+            n=n,
+            concurrency=concurrency,
+            max_tokens=max_tokens,
+            seed_base=seed_base,
+            prompt_cache=prompt_cache,
+            normalizers=list(normalizers),
+            overrides={k: v for k, v in (overrides or {}).items() if v is not None},
+            logprobs=logprobs,
+        )
+    except ValueError as exc:
+        raise OperationError(str(exc)) from None
+
+
+def load(store: Store, run_reference: str, step_reference: str):
+    """The checkpoint a run and step name, whichever way each is named."""
+    from tuningfork.experiment import CheckpointError, load_checkpoint
+
+    run = resolve_run(store, run_reference)
+    index = step_index(store, run, step_reference)
+    try:
+        return load_checkpoint(store, run_reference, index)
+    except CheckpointError as exc:
+        raise OperationError(str(exc)) from None
+
+
+@dataclass(slots=True)
+class Estimate:
+    """How long sampling may take, from how long the recorded step took."""
+
+    recorded_seconds: float
+    #: The recorded step's time for every sample: an upper bound when samples reuse the
+    #: server's cache of the prompt. None when each processes its whole prompt instead —
+    #: work the recorded step, mostly cached, did not do — so its time bounds nothing.
+    worst_minutes: float | None
+    #: Each sample processes its whole prompt, this many tokens when the step recorded it.
+    fresh: bool = False
+    prompt_tokens: int | None = None
+    #: Whether the recorded step read most of its prompt from the server's cache: on a server
+    #: started with --no-cache-prompt it read none, and its time is a whole prompt's.
+    cached: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "recorded_seconds": round(self.recorded_seconds, 2),
+            "worst_minutes": round(self.worst_minutes, 2) if self.worst_minutes is not None else None,
+            "fresh": self.fresh,
+            "prompt_tokens": self.prompt_tokens,
+            "cached": self.cached,
+        }
+
+
+def estimate(checkpoint, plan, *, arms: int = 1) -> Estimate | None:
+    recorded_ms = (checkpoint.step.timings or {}).get("total_ms")
+    if not recorded_ms:
+        return None
+    from tuningfork.backends.llamacpp import CACHE_PROMPT_ENDPOINTS
+
+    wire = getattr(checkpoint, "wire", None)
+    usage = checkpoint.step.usage or {}
+    tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+    read = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    cached = isinstance(read, int) and isinstance(tokens, int) and tokens > 0 and read > tokens / 2
+    if not getattr(plan, "prompt_cache", True) and getattr(wire, "endpoint", None) in CACHE_PROMPT_ENDPOINTS:
+        return Estimate(recorded_seconds=recorded_ms / 1000, worst_minutes=None, fresh=True,
+                        prompt_tokens=tokens if isinstance(tokens, int) else None, cached=cached)
+    # The recorded step's time for every sample: an upper bound when samples reuse a cached
+    # prefix, and about right when the server processes every prompt whole.
+    worst = recorded_ms / 1000 * plan.n * arms / plan.concurrency
+    return Estimate(recorded_seconds=recorded_ms / 1000, worst_minutes=worst / 60, cached=cached)
+
+
+# --- resample -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ResamplePlan:
+    checkpoint: Any
+    plan: Any
+    base_url: str
+
+    @property
+    def estimate(self) -> Estimate | None:
+        return estimate(self.checkpoint, self.plan)
+
+    def to_json(self) -> dict[str, Any]:
+        guess = self.estimate
+        return {
+            "checkpoint": self.checkpoint.to_json(),
+            "sampling": self.plan.as_settings(),
+            "base_url": self.base_url,
+            "estimate": guess.to_json() if guess else None,
+        }
+
+
+def experiment_json(experiment: Any) -> dict[str, Any]:
+    """An experiment as a result names it: enough to find and link it."""
+    return {
+        "id": experiment.id,
+        "kind": experiment.kind,
+        "arm": experiment.arm,
+        "group_id": experiment.group_id,
+        "run_id": experiment.run_id,
+        "step_idx": experiment.step_idx,
+        "hold_id": experiment.hold_id,
+        "samples": experiment.sample_count,
+    }
+
+
+@dataclass(slots=True)
+class ResampleResult:
+    experiment: Any
+    distribution: Any
+    elapsed: float
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "experiment": experiment_json(self.experiment),
+            "distribution": self.distribution.to_json(),
+            "elapsed": round(self.elapsed, 2),
+        }
+
+
+def prepare_resample(
+    store: Store,
+    run: str,
+    step: str,
+    *,
+    base_url: str | None = None,
+    **plan: Any,
+) -> ResamplePlan:
+    checkpoint = load(store, run, step)
+    refuse_trashed(checkpoint.run)
+    from tuningfork.endpoints import check_endpoint
+
+    sampling = make_plan(**plan)
+    if sampling.logprobs is not None and checkpoint.wire.name != "openai-chat":
+        raise OperationError(
+            f"step {checkpoint.step.idx} was a {checkpoint.wire.endpoint} call, and that API has "
+            "no logprobs",
+            hint=f"score the answer the run gave instead: `tuningfork tokens {checkpoint.run.id[:8]} "
+            f"{checkpoint.step.idx} --score`",
+            field="logprobs",
+        )
+    return ResamplePlan(
+        checkpoint=checkpoint,
+        plan=sampling,
+        base_url=check_endpoint(base_url or default_upstream(), home=store.home, purpose="sampling"),
+    )
+
+
+async def execute_resample(
+    store: Store,
+    prepared: ResamplePlan,
+    *,
+    progress: Progress | None = None,
+    cancel: Cancel | None = None,
+) -> ResampleResult:
+    from tuningfork.experiment import experiment_distribution, run_resample
+
+    started = time.monotonic()
+    created: list[Any] = []
+    try:
+        experiment = await _cancellable(
+            run_resample(
+                store, prepared.checkpoint, prepared.plan,
+                base_url=prepared.base_url, progress=_tracking(created, progress),
+            ),
+            cancel,
+        )
+    except Cancelled as stopped:
+        _stopped(store, created, stopped.reason)
+        partial = (
+            ResampleResult(
+                experiment=created[0],
+                distribution=experiment_distribution(store, created[0]),
+                elapsed=time.monotonic() - started,
+            )
+            if created
+            else None
+        )
+        raise Cancelled(stopped.reason, partial=partial) from None
+    return ResampleResult(
+        experiment=experiment,
+        distribution=experiment_distribution(store, experiment),
+        elapsed=time.monotonic() - started,
+    )
+
+
+# --- A/B ----------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class StepTargets:
+    """What an A/B at a step can declare as its target before sampling: a behaviour of the
+    latest resample of that step, by its letter."""
+
+    checkpoint: Any
+    resample: Any
+    behaviours: Any
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "checkpoint": self.checkpoint.to_json(),
+            "resample": experiment_json(self.resample) if self.resample else None,
+            # A letter names a behaviour only under the normalizers it was clustered with.
+            "normalizers": self.resample.normalizers if self.resample else [],
+            "behaviours": self.behaviours.to_json() if self.behaviours else None,
+        }
+
+
+def step_targets(store: Store, run: str, step: str) -> StepTargets:
+    from tuningfork.experiment import experiment_distribution
+    from tuningfork.experiment.sampling import step_resample
+
+    checkpoint = load(store, run, step)
+    resample = step_resample(store, checkpoint)
+    behaviours = experiment_distribution(store, resample) if resample else None
+    return StepTargets(checkpoint=checkpoint, resample=resample, behaviours=behaviours)
+
+
+@dataclass(slots=True)
+class RecordedSkill:
+    """The skill file a run was given, as its batch kept it: the baseline of a variant."""
+
+    run_id: str
+    skill: str
+    path: Path | None
+    text: str | None
+
+    def to_json(self) -> dict[str, Any]:
+        from tuningfork.experiment.skill import text_sha256
+
+        return {
+            "run_id": self.run_id,
+            "skill": self.skill,
+            "path": str(self.path) if self.path else None,
+            "text": self.text,
+            "sha256": text_sha256(self.text) if self.text is not None else None,
+        }
+
+
+def recorded_skill(store: Store, run: str) -> RecordedSkill:
+    from tuningfork.ops.variants import skill_name
+
+    found = resolve_run(store, run)
+    path = recorded_skill_file(found)
+    return RecordedSkill(
+        run_id=found.id,
+        skill=skill_name(found, path),
+        path=path,
+        text=path.read_text(encoding="utf-8") if path else None,
+    )
+
+
+@dataclass(slots=True)
+class ABPlan:
+    checkpoint: Any
+    plan: Any
+    base_url: str
+    original: Path
+    variant: Path
+    original_text: str
+    variant_text: str
+    #: Where the original wording sits in the checkpoint's context.
+    spans: list[Any]
+    #: Parts of the edit that cannot reach the model, as sentences.
+    unapplied: list[str]
+    #: The declared target, if any: what the confirmatory test is about.
+    target: Any
+    alpha: float = 0.05
+    #: Things a person should know before sampling, which do not stop it.
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def estimate(self) -> Estimate | None:
+        return estimate(self.checkpoint, self.plan, arms=2)
+
+    def to_json(self) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        from tuningfork.experiment.skill import text_sha256
+
+        guess = self.estimate
+        return {
+            "checkpoint": self.checkpoint.to_json(),
+            "sampling": self.plan.as_settings(),
+            "base_url": self.base_url,
+            "original": str(self.original),
+            "variant": str(self.variant),
+            "original_sha256": text_sha256(self.original_text),
+            "variant_sha256": text_sha256(self.variant_text),
+            "spans": [asdict(span) for span in self.spans],
+            "unapplied": self.unapplied,
+            "target": self.target.description if self.target else None,
+            "alpha": self.alpha,
+            "warnings": self.warnings,
+            "estimate": guess.to_json() if guess else None,
+        }
+
+
+@dataclass(slots=True)
+class ABResult:
+    run: Any
+    comparison: Any
+    #: The history caveat (`experiment.sampling.history_caveat`), sharpened by what this
+    #: checkpoint holds.
+    caveat: str
+    elapsed: float
+
+    def to_json(self) -> dict[str, Any]:
+        from dataclasses import asdict
+
+        return {
+            "experiments": {
+                "original": experiment_json(self.run.original),
+                "variant": experiment_json(self.run.variant),
+            },
+            "spans": [asdict(span) for span in self.run.spans],
+            "comparison": self.comparison.to_json(),
+            "caveat": self.caveat,
+            "elapsed": round(self.elapsed, 2),
+        }
+
+
+def prepare_ab(
+    store: Store,
+    run: str,
+    step: str,
+    *,
+    variant: Path,
+    original: Path | None = None,
+    target: str | None = None,
+    target_match: str | None = None,
+    alpha: float = 0.05,
+    base_url: str | None = None,
+    normalizers: Sequence[str] = (),
+    variant_text: str | None = None,
+    target_rules: Sequence[dict[str, str]] | None = None,
+    **plan: Any,
+) -> ABPlan:
+    """An A/B at a checkpoint, checked before any sample is drawn.
+
+    `variant` is the variant's file. With `variant_text`, that is where the text will be
+    saved when the A/B starts — a wording edited in the browser is written only then.
+    """
+    from tuningfork.experiment import (
+        CheckpointError,
+        SkillNotFound,
+        locate,
+        resolve_target,
+        substitute,
+        unapplied,
+    )
+    from tuningfork.experiment.skill import diagnose
+    from tuningfork.paths import host_path
+
+    checkpoint = load(store, run, step)
+    refuse_trashed(checkpoint.run)
+    for name, value in (("original", original), ("variant", variant)):
+        # An agent once passed the skill's whole text here: say what the field is for, rather
+        # than that a file named after the text does not exist.
+        if value is not None and "\n" in str(value):
+            raise OperationError(
+                f"{name} is the path of a skill file, not the skill's text",
+                hint="give the edited wording as variant_text; leave original out to compare "
+                "with the skill the run was given",
+                field=name,
+            )
+    variant = Path(host_path(str(variant)))
+    recorded = recorded_skill_file(checkpoint.run)
+    if original:
+        original = Path(host_path(str(original)))
+    elif recorded is not None:
+        original = recorded
+    elif variant_text is not None:
+        raise OperationError(
+            f"run {checkpoint.run.id[:8]} kept no copy of the skill file it was given",
+            hint="name the original: the skill file as it was when the run was recorded",
+            field="original",
+        )
+    else:
+        original = variant.with_name("SKILL.md")
+    if original.resolve() == variant.resolve():
+        raise OperationError("the variant and the original are the same file")
+    for path in (original, variant):
+        if path == variant and variant_text is not None:
+            continue
+        if not path.exists():
+            detail = None
+            if path == original:
+                detail = "name the original: the skill file as it was when the run was recorded"
+            raise OperationError(
+                f"{path} does not exist", detail=detail,
+                field="original" if path == original else "variant",
+            )
+    original_text = original.read_text(encoding="utf-8")
+    if variant_text is None:
+        variant_text = variant.read_text(encoding="utf-8")
+    if variant_text == original_text:
+        raise OperationError("the variant and the original are the same text", field="variant_text")
+
+    warnings: list[str] = []
+    try:
+        declared, target_normalizers = resolve_target(
+            store, checkpoint, letter=target, pattern=target_match, rules=target_rules
+        )
+    except (CheckpointError, ValueError) as exc:
+        raise OperationError(str(exc), field="target_rules" if target_rules else None) from None
+    normalizers = list(normalizers)
+    if target_normalizers is not None and normalizers != target_normalizers:
+        if normalizers:
+            warnings.append(
+                "--normalizer ignored: a lettered target is only meaningful under the "
+                "normalizers of the resample it came from"
+            )
+        normalizers = target_normalizers
+
+    sampling = make_plan(normalizers=normalizers, **plan)
+    spans = locate(checkpoint.request, original_text)
+    if not spans:
+        raise OperationError(
+            f"{original} is not in the context at this step.",
+            detail=diagnose(checkpoint.request, original_text),
+        )
+    try:
+        substitute(checkpoint.request, original_text, variant_text)
+    except SkillNotFound as exc:
+        raise OperationError(str(exc)) from None
+    from tuningfork.endpoints import check_endpoint
+
+    check_endpoint(base_url or default_upstream(), home=store.home, purpose="sampling")
+    return ABPlan(
+        checkpoint=checkpoint,
+        plan=sampling,
+        base_url=base_url or default_upstream(),
+        original=original,
+        variant=variant,
+        original_text=original_text,
+        variant_text=variant_text,
+        spans=spans,
+        unapplied=unapplied(original_text, variant_text, spans),
+        target=declared,
+        alpha=alpha,
+        warnings=warnings,
+    )
+
+
+async def execute_ab(
+    store: Store,
+    prepared: ABPlan,
+    *,
+    progress: Progress | None = None,
+    cancel: Cancel | None = None,
+) -> ABResult:
+    from tuningfork.analysis.distribution import compare_arms
+    from tuningfork.experiment import SkillNotFound, experiment_outcomes, experiment_reasoning, history_caveat, run_ab
+
+    started = time.monotonic()
+    created: list[Any] = []
+    try:
+        result = await _cancellable(
+            run_ab(
+                store,
+                prepared.checkpoint,
+                prepared.plan,
+                base_url=prepared.base_url,
+                original_text=prepared.original_text,
+                variant_text=prepared.variant_text,
+                original_path=str(prepared.original),
+                variant_path=str(prepared.variant),
+                target=prepared.target,
+                progress=_tracking(created, progress),
+            ),
+            cancel,
+        )
+    except SkillNotFound as exc:
+        raise OperationError(str(exc)) from None
+    except Cancelled as stopped:
+        _stopped(store, created, stopped.reason)
+        # What was sampled is stored and can be re-reported; there is no comparison yet.
+        raise Cancelled(stopped.reason, partial=created) from None
+    comparison = compare_arms(
+        experiment_outcomes(store, result.original),
+        experiment_outcomes(store, result.variant),
+        target=prepared.target,
+        alpha=prepared.alpha,
+        reasoning=(experiment_reasoning(store, result.original), experiment_reasoning(store, result.variant)),
+    )
+    return ABResult(
+        run=result,
+        comparison=comparison,
+        caveat=history_caveat(prepared.checkpoint),
+        elapsed=time.monotonic() - started,
+    )
+
+
+def _tracking(created: list[Any], progress: Progress | None) -> Progress:
+    """Forward progress, keeping the experiments it reports as they are created."""
+
+    def track(event: Any) -> None:
+        if event.kind == "experiment":
+            created.append(event.subject)
+        if progress is not None:
+            progress(event)
+
+    return track
+
+
+def _stopped(store: Store, experiments: list[Any], reason: str) -> None:
+    """Experiments stopped by tuningfork shutting down read as interrupted, not cancelled:
+    no one asked for them to stop."""
+    if reason == "shutdown":
+        store.set_experiment_status([e.id for e in experiments], "interrupted")
+
+
+async def _cancellable(work, cancel: Cancel | None):
+    """Run `work`, stopping it — samples already drawn stay recorded — if `cancel` fires.
+
+    Stopped by `cancel`, it raises `Cancelled`; cancelled from outside (Ctrl-C in the CLI,
+    say), the `CancelledError` goes on as it came.
+    """
+    if cancel is None:
+        return await work
+    task = asyncio.ensure_future(work)
+    loop = asyncio.get_running_loop()
+    unregister = cancel.on_cancel(lambda: loop.call_soon_threadsafe(task.cancel))
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if cancel.cancelled:
+            raise Cancelled(cancel.reason or "cancelled") from None
+        raise
+    finally:
+        unregister()

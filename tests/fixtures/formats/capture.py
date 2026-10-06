@@ -1,0 +1,109 @@
+"""Capture output-format fixtures from a real server: raw generated text beside the server's
+own parse of it.
+
+Not a test. Run it against a llama.cpp server to (re)make the fixtures `tests/test_formats.py`
+checks a format against:
+
+    TUNINGFORK_REAL_SERVER=http://127.0.0.1:8081 uv run python tests/fixtures/formats/capture.py gemma4
+
+Each case asks for an answer with logprobs, which cover every generated token — reasoning,
+channel markers and tool-call syntax included — so the joined tokens are the raw text. The
+server's parsed message comes in the same response. Protected endpoints are refused.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+import httpx
+
+from tuningfork.endpoints import check_endpoint, guard_hooks
+
+ROOT = os.environ.get("TUNINGFORK_REAL_SERVER", "http://127.0.0.1:8081").rstrip("/")
+HERE = Path(__file__).parent
+
+
+def _tool(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": {
+        "type": "object", "properties": properties, "required": required}}}
+
+
+WEATHER = _tool("get_weather", "Get the current weather for a city", {"city": {"type": "string"}}, ["city"])
+WRITE = _tool("write_file", "Write a file", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"])
+EVENT = _tool("create_event", "Create a calendar event", {
+    "title": {"type": "string"}, "attendees": {"type": "array", "items": {"type": "string"}},
+    "location": {"type": "object", "properties": {"city": {"type": "string"}, "zip": {"type": "string"}}},
+    "priority": {"type": "integer"}, "confirmed": {"type": "boolean"}}, ["title"])
+EXPENSE = _tool("record_expense", "Record an expense", {
+    "amount": {"type": "number"}, "currency": {"type": "string"}, "note": {"type": ["string", "null"]}},
+    ["amount", "currency"])
+
+CASES = {
+    "text": {"messages": [{"role": "user", "content": "What is 17 times 3? Answer in one short sentence."}]},
+    "text-nothink": {"messages": [{"role": "user", "content": "Say hello in French, one word."}],
+                     "chat_template_kwargs": {"enable_thinking": False}},
+    "one-call": {"messages": [{"role": "user", "content": "What's the weather in Paris right now?"}], "tools": [WEATHER]},
+    "parallel": {"messages": [{"role": "user", "content": "Get the current weather in Paris and in Tokyo. Call the tool once for each city, both at once."}],
+                 "tools": [WEATHER], "parallel_tool_calls": True},
+    "braces": {"messages": [{"role": "user", "content": 'Write the file config.json containing exactly this JSON: {"a": {"b": [1, 2]}, "note": "x: y, {z}"}'}],
+               "tools": [WRITE]},
+    "nested": {"messages": [{"role": "user", "content": "Create an event titled 'Kickoff' with attendees Ann and Bo, located in Berlin, zip 10115, priority 2, confirmed."}],
+               "tools": [EVENT]},
+    "unicode": {"messages": [{"role": "user", "content": "Write a file named café.txt whose content is: naïve résumé — 日本語 ✓"}], "tools": [WRITE]},
+    "numbers": {"messages": [{"role": "user", "content": "Record an expense of 61.50 USD with no note."}], "tools": [EXPENSE]},
+    "text-then-call": {"messages": [{"role": "user", "content": "First tell me in one sentence what you will do, then check the weather in Oslo."}],
+                       "tools": [WEATHER]},
+    "no-call-with-tools": {"messages": [{"role": "user", "content": "Just say hi. Do not call any tool."}], "tools": [WEATHER]},
+}
+
+
+def piece(entry: dict) -> str:
+    raw = entry.get("bytes")
+    return bytes(raw).decode("utf-8", "replace") if isinstance(raw, list) else entry.get("token", "")
+
+
+async def capture(fmt: str, seeds: tuple[int, ...] = (1, 2)) -> None:
+    home = Path(os.environ.get("TUNINGFORK_HOME") or Path.home() / ".tuningfork")
+    check_endpoint(ROOT, home=home, purpose="fixture capture")
+    out = HERE / fmt
+    out.mkdir(exist_ok=True)
+    async with httpx.AsyncClient(timeout=600, event_hooks=guard_hooks(home=home)) as http:
+        for name, case in CASES.items():
+            prompt = (await http.post(f"{ROOT}/apply-template", json=case)).json()["prompt"]
+            for seed in seeds:
+                body = {**case, "max_tokens": 2048, "logprobs": True, "top_logprobs": 1, "seed": seed}
+                response = await http.post(f"{ROOT}/v1/chat/completions", json=body)
+                response.raise_for_status()
+                data = response.json()
+                choice = data["choices"][0]
+                entries = choice["logprobs"]["content"]
+                message = choice["message"]
+                fixture = {
+                    "case": name,
+                    "seed": seed,
+                    "tools": bool(case.get("tools")),
+                    "parallel": bool(case.get("parallel_tool_calls", True)),
+                    "thinking": "<|think|>" in prompt,
+                    "finish_reason": choice.get("finish_reason"),
+                    "completion_tokens": data["usage"]["completion_tokens"],
+                    "pieces": [piece(entry) for entry in entries],
+                    "message": {
+                        "content": message.get("content") or "",
+                        "reasoning_content": message.get("reasoning_content") or "",
+                        "tool_calls": [
+                            {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+                            for call in message.get("tool_calls") or []
+                        ],
+                    },
+                }
+                path = out / f"{name}-{seed}.json"
+                path.write_text(json.dumps(fixture, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+                print(f"{path.name}: {fixture['completion_tokens']} tokens")
+
+
+if __name__ == "__main__":
+    asyncio.run(capture(sys.argv[1] if len(sys.argv) > 1 else "gemma4"))

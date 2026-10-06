@@ -1,0 +1,12 @@
+run <run pilot> step 0
+  model   mock-model
+  params  {}
+  server  {"n_ctx": 65536, "temperature": 1.0, "top_p": 0.95}
+  timings {}
+
+context
+  [0] system: You are an agent.  [IMPORTANT: The user launched this CLI session with the "tally-report" skill prel…
+  [1] user: Use the tally-report skill on data.csv.
+
+response
+  tool_call read_file({"path": "data.csv"})

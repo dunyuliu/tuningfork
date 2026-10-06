@@ -1,0 +1,41 @@
+# Security
+
+## Reporting a vulnerability
+
+Please report it privately, with **Report a vulnerability** on this repository's Security tab,
+not in a public issue.
+
+## What tuningfork guards, and what it does not
+
+tuningfork runs on your own machine, beside your model server and your agent harness. What it
+does to keep that local:
+
+- **It listens on loopback only, by default.** The proxy and its web UI bind to `127.0.0.1`,
+  answer only to a loopback `Host`, and refuse a cross-site change by its `Origin`. Every
+  change of state needs the access token that `serve` mints and writes to
+  `<recordings>/.access-token` (mode 0600). Reads need no token: anything that can reach the
+  port can read the recordings.
+- **An agent's MCP client holds no key to the rest.** The MCP endpoint takes a token of its
+  own, and no other; the access token is refused there. No MCP tool approves an edit to a
+  skill, and none offers the held-out results an edit is judged by.
+- **Model servers you protect receive nothing from it.** List them in
+  `~/.config/tuningfork/config.json` (`{"protected": ["localhost:1234"]}`), in
+  `TUNINGFORK_PROTECTED`, or in a recordings folder's `config.json`.
+- **Recordings stay where you put them.** The built-in proposer sends recorded prompts and
+  answers only to the endpoint you configure, and to one that is not your machine only once
+  you allow it. Its key comes from `TUNINGFORK_PROPOSER_KEY` or a 0600 file, never anywhere
+  else.
+- **Strings shaped like secrets are redacted before they are stored**: `sk-…` keys, bearer
+  tokens, `api_key=…` and the like, GitHub, AWS and Slack tokens. That is a net, not a
+  promise. Recordings hold what your harness sent and received — prompts, tool output, file
+  contents — so read a recordings folder before you share one.
+
+What it does **not** do:
+
+- **The sandbox is not a security boundary.** Where bubblewrap runs, every launch sees the
+  same home and project folder, so runs are comparable. The rest of the machine stays
+  readable inside, your home included, and the network is reachable. It keeps runs alike,
+  not an agent contained.
+- **It runs what you give it, as you.** A harness tuningfork launches runs with your
+  permissions, and a task's check is a shell command from its spec. Run harnesses, tasks and
+  specs you trust.

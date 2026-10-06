@@ -1,0 +1,18 @@
+Tuning Fork
+Copyright 2026 Heyuan Huang
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Tuning Fork follows, or includes, work from these projects, each under the MIT License:
+
+llama.cpp — https://github.com/ggml-org/llama.cpp
+Copyright (c) 2023-2026 The ggml authors
+  src/tuningfork/backends/llamacpp/anthropic.py follows, rule for rule, how llama.cpp's server
+  converts an Anthropic Messages request into a chat-completions one
+  (tools/server/server-chat.cpp, build b11108); src/tuningfork/backends/formats/gemma4.py
+  follows its parser of Gemma 4's output (common/parsers/gemma4.cpp). Neither copies its code.
+
+Hermes Agent — https://hermes-agent.nousresearch.com
+Copyright (c) 2025 Nous Research
+  examples/hermes-design-md/design-md/ is Hermes Agent's own design-md skill, as Hermes 0.18.2
+  ships it. Its licence is in examples/hermes-design-md/LICENSE-hermes.

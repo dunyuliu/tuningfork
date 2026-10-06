@@ -1,0 +1,9 @@
+t/1 · hermes · m
+ skill     runs  check passed          
+ 832e8905  3     2/3  67%  [21%-94%]   
+
+tally-report/1 · mock-model
+ skill  runs  check passed   
+ -      1     -              
+
+skill: a fingerprint of the skill files the runs were given. Intervals are Wilson 95%.

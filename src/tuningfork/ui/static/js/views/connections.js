@@ -1,0 +1,372 @@
+// Connections: the inference server the proxy forwards to, the harnesses it can launch, and
+// the proxy itself.
+//
+// The server can be switched here — after a dry run shows what would change — but only
+// while nothing is using the proxy, so no run is recorded half on one server and half on
+// another. What a harness needs of the server is measured by a server check, not assumed.
+
+import { api, enc } from "../api.js";
+import { guard } from "../auth.js";
+import { chip, command, h, kv, loading, panel, replace, short, when } from "../dom.js";
+import { field, formError, input } from "../forms.js";
+import { live } from "../live.js";
+
+const USES = {
+  streaming_tool_calls: "Hermes streams every call and acts on its tool calls",
+  anthropic_messages: "Claude Code speaks only /v1/messages",
+};
+const SUPPORT_TONE = { yes: "ok", no: "bad", unknown: "warn" };
+
+export async function connectionsView(root, _, scope) {
+  if (live.mode !== "live") {
+    replace(root, h("div", { class: "panel empty" }, h("h2", null, "No live proxy"),
+      h("p", null, "Connections belong to a running proxy: start one with `tuningfork serve` and open its UI.")));
+    return;
+  }
+  replace(root, loading());
+  const serverEl = h("div");
+  const proposerEl = h("div");
+  const harnessesEl = h("div", { class: "stack" });
+  const proxyEl = h("div");
+  replace(root,
+    h("div", { class: "page-head" }, h("div", null, h("h1", null, "Connections"),
+      h("p", { class: "sub" }, "What the proxy talks to. Harness and proposer settings are kept in the recordings folder, never in a harness's own configuration."))),
+    h("div", { class: "stack" }, serverEl, proposerEl, panel("Harnesses", harnessesEl, {
+      actions: h("button", { class: "btn btn-small", type: "button", "data-control": true, onclick: guard(detect) }, "Detect again"),
+    }), proxyEl));
+
+  let state = null;
+  async function load() {
+    const [connections, proposer] = await Promise.all([api.get("/connections"), api.get("/proposer")]);
+    state = { ...connections, proposer };
+    if (!scope.active) return;
+    drawServer();
+    drawProposer();
+    drawHarnesses();
+    drawProxy();
+  }
+  async function detect() {
+    replace(harnessesEl, loading("Running each harness's --version…"));
+    await api.post("/connections/harnesses/detect");
+    await load();
+  }
+
+  // --- the server -----------------------------------------------------------------------
+
+  let switcher = null;
+  function drawServer() {
+    const server = state.server;
+    const identity = server.identity || {};
+    const results = server.checks?.results || {};
+    switcher ??= switchForm();
+    replace(serverEl, panel("Inference server", [
+      server.problem
+        ? h("div", { class: "banner banner-warn" }, h("strong", null, "Not answering: "), `${server.problem}. `,
+            "Start the server — or let it finish loading its model — then check it again.")
+        : null,
+      kv([
+        ["forwarding to", h("span", { class: "mono" }, server.url)],
+        ["started with", server.started_with !== server.url ? h("span", { class: "mono" }, server.started_with) : null],
+        ["build", identity.build ? h("span", { class: "mono" }, String(identity.build)) : null],
+        ["model file", identity.model_file ? h("span", { class: "mono" }, identity.model_file) : null],
+        ["models", (identity.models || []).length ? h("span", { class: "mono" }, identity.models.join(", ")) : null],
+        ["context", identity.n_ctx ? `${Number(identity.n_ctx).toLocaleString()} tokens` : null],
+        ["slots", identity.slots ?? null],
+        ["identity", identity.id ? h("span", { class: "mono" }, short(identity.id)) : "not read yet"],
+      ]),
+      h("div", { class: "label" }, "Measured"),
+      Object.keys(results).length
+        ? h("table", { class: "table" }, h("tbody", null, Object.entries(results).map(([name, found]) =>
+            h("tr", null,
+              h("td", { class: "mono" }, name.replaceAll("_", " ")),
+              h("td", null, chip(found.support, SUPPORT_TONE[found.support] || "muted")),
+              h("td", { class: "muted small" }, found.detail || ""),
+              h("td", { class: "faint small" }, USES[name] || "")))))
+        : h("p", { class: "muted small" }, "Nothing measured on this server yet."),
+      h("div", { class: "form-actions" }, checkButton(identity.models || [], server.checks?.model),
+        server.checks?.checked_at ? h("span", { class: "faint small" }, `checked ${when(server.checks.checked_at)} with ${server.checks.model}`) : null),
+      h("details", { class: "fold" }, h("summary", null, "Point the proxy at another server"), switcher),
+    ]));
+  }
+
+  function checkButton(models, last) {
+    const note = h("span", { class: "muted small" });
+    // A server that lists several models is checked with one of them, chosen here.
+    const choice = models.length > 1
+      ? h("select", { class: "field", name: "check_model", "aria-label": "Model to check with" },
+          models.map((name) => h("option", { value: name, selected: name === last }, name)))
+      : null;
+    const button = h("button", {
+      class: "btn btn-small", type: "button", "data-control": true,
+      onclick: guard(async () => {
+        button.disabled = true;
+        note.textContent = "checking: a streaming tool call, a Messages call, then what token work needs…";
+        try {
+          const job = await api.post("/jobs", { kind: "server-check", params: choice ? { model: choice.value } : {} });
+          await finished(job.id);
+          await load();
+        } catch (error) {
+          note.textContent = error.hint ? `${error.message} — ${error.hint}` : error.message;
+          button.disabled = false;
+        }
+      }),
+    }, "Check the server");
+    return h("span", { class: "controls" }, choice, button, note);
+  }
+
+  async function finished(jobId) {
+    for (;;) {
+      const job = await api.get(`/jobs/${enc(jobId)}`);
+      if (!["queued", "running"].includes(job.status)) {
+        if (job.status !== "done") {
+          throw Object.assign(new Error(job.error?.message || `the check ${job.status}`), { hint: job.error?.hint || null });
+        }
+        return job;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  function switchForm() {
+    const url = input("url", { placeholder: "http://127.0.0.1:8081" });
+    const preview = h("div", { class: "plan-preview" });
+    const status = h("div");
+    const go = h("button", { class: "btn btn-warn", type: "submit", disabled: true, "data-control": true }, "Switch");
+    let asked = 0;
+    let shown = null;
+    let timer = null;
+    const form = h("form", {
+      class: "plan-form", novalidate: true,
+      oninput: () => {
+        go.disabled = true;
+        clearTimeout(timer);
+        timer = setTimeout(check, 400);
+      },
+      onsubmit: guard(async (event) => {
+        event.preventDefault();
+        if (url.value.trim() !== shown) return;
+        go.disabled = true;
+        try {
+          await api.post("/connections/upstream", { url: shown });
+          url.value = "";
+          shown = null;
+          replace(preview);
+          replace(status, h("p", { class: "hint" }, "Switched. Steps recorded from now on name the new server."));
+          await load();
+        } catch (error) {
+          replace(status, formError(error));
+        }
+      }),
+    },
+    h("p", { class: "hint" }, "Only while nothing uses the proxy: no call in flight or held, no job, no launched harness running."),
+    h("label", { class: "form-field" }, h("span", { class: "form-label" }, "Server address"), url),
+    status, preview, h("div", { class: "form-actions" }, go));
+
+    async function check() {
+      const mine = ++asked;
+      const target = url.value.trim();
+      shown = null;
+      replace(preview);
+      if (!target) {
+        replace(status);
+        return;
+      }
+      replace(status, h("span", { class: "muted small" }, "asking it…"));
+      try {
+        const plan = await api.post("/connections/upstream", { url: target, dry_run: true });
+        if (mine !== asked) return;
+        replace(status);
+        replace(preview, switchPreview(plan));
+        shown = plan.busy.length ? null : target;
+        go.disabled = shown === null || url.value.trim() !== shown;
+      } catch (error) {
+        if (mine !== asked) return;
+        replace(status, formError(error));
+      }
+    }
+    return form;
+  }
+
+  function switchPreview(plan) {
+    return h("div", { class: "stack", style: { gap: "8px" } },
+      plan.differences.length
+        ? h("table", { class: "table" },
+            h("thead", null, h("tr", null, h("th", null, "what"), h("th", null, "now"), h("th", null, "after"))),
+            h("tbody", null, plan.differences.map((change) => h("tr", null,
+              h("td", { class: "mono" }, change.field),
+              h("td", { class: "mono small" }, JSON.stringify(change.current ?? null)),
+              h("td", { class: "mono small" }, JSON.stringify(change.proposed ?? null))))))
+        : h("p", { class: "muted small" }, "It reports itself the same as the server now in use."),
+      plan.busy.length
+        ? h("div", { class: "banner banner-warn" }, h("strong", null, "Not now: "), plan.busy.join("; "), ".")
+        : null);
+  }
+
+  // --- the built-in proposer: which model proposes edits, and its key ---------------------
+  //
+  // The key can be set or cleared here, never read back: the page is told only whether one is
+  // set, and where it comes from.
+
+  function drawProposer() {
+    const settings = state.proposer;
+    const key = settings.key || {};
+    const error = h("div");
+    const url = input("proposer_url", { value: settings.url || "", placeholder: "none: the proxy's own server, through the proxy" });
+    const wire = h("select", { class: "field", name: "proposer_wire" },
+      [["openai-chat", "OpenAI chat completions"], ["anthropic-messages", "Anthropic Messages"]].map(([value, label]) =>
+        h("option", { value, selected: value === settings.wire }, label)));
+    const model = input("proposer_model", { value: settings.model || "", placeholder: "the server's default" });
+    const maxTokens = input("proposer_max_tokens", { type: "number", value: settings.max_tokens, min: 256, max: 131072 });
+    const temperature = input("proposer_temperature", { type: "number", value: settings.temperature ?? "", min: 0, max: 2, step: "any" });
+    const remote = h("input", { type: "checkbox", name: "proposer_allow_remote", checked: settings.allow_remote });
+    const secret = h("input", { class: "field mono", type: "password", name: "proposer_key", autocomplete: "off", spellcheck: "false", placeholder: "an API key" });
+    const save = async (path, body) => {
+      replace(error);
+      try {
+        await api.put(path, JSON.stringify(body), "application/json");
+        await load();
+      } catch (failure) {
+        replace(error, formError(failure));
+      }
+    };
+    const number = (field) => (field.value.trim() === "" ? null : Number(field.value));
+    replace(proposerEl, panel("Proposer", [
+      kv([
+        ["asks", settings.url
+          ? h("span", { class: "mono" }, settings.url)
+          : h("span", null, "the server above, ", h("span", { class: "muted" }, "through the proxy: gated, never recorded"))],
+        ["model", settings.model ? h("span", { class: "mono" }, settings.model) : h("span", { class: "muted" }, "the server's default")],
+        ["wire", h("span", { class: "mono" }, settings.wire)],
+        ["max tokens", String(settings.max_tokens)],
+        ["temperature", settings.temperature === null ? "the server's default" : String(settings.temperature)],
+        ["another machine", settings.allow_remote ? chip("allowed", "warn") : chip("not allowed", "muted")],
+        ["key", key.set ? chip(key.from === "environment" ? "set, from TUNINGFORK_PROPOSER_KEY" : "set, in the recordings folder", "ok") : chip("not set", "muted")],
+      ]),
+      h("p", { class: "hint" }, "The model the built-in proposer asks for edits of a skill, on a refinement's page. What it is sent — the skill, recorded prompts and answers — goes to this address."),
+      error,
+      h("details", { class: "fold" }, h("summary", null, "Change the proposer"),
+        h("form", {
+          class: "plan-form proposer-form", novalidate: true,
+          onsubmit: guard(async (event) => {
+            event.preventDefault();
+            await save("/proposer", {
+              url: url.value.trim() || null, wire: wire.value, model: model.value.trim() || null,
+              max_tokens: number(maxTokens), temperature: number(temperature), allow_remote: remote.checked,
+            });
+          }),
+        },
+        h("div", { class: "form-grid" },
+          field("Address", url, { help: "Empty: the proxy's own server. A cloud API's base, e.g. https://api.anthropic.com.", wide: true }),
+          field("Speaks", wire),
+          field("Model", model),
+          field("Max tokens", maxTokens, { help: "A model that reasons first needs thousands." }),
+          field("Temperature", temperature, { help: "Empty: the server's default." })),
+        h("label", { class: "inline-check" }, remote,
+          " Allow an address that is not this machine — the evidence it is sent holds recorded prompts, answers and your skill"),
+        h("div", { class: "form-actions" }, h("button", { class: "btn btn-small", type: "submit", "data-control": true }, "Save")))),
+      h("details", { class: "fold" }, h("summary", null, key.set ? "Replace or clear the key" : "Set a key"),
+        h("form", {
+          class: "plan-form", novalidate: true,
+          onsubmit: guard(async (event) => {
+            event.preventDefault();
+            const given = secret.value.trim();
+            secret.value = "";
+            if (given) await save("/proposer/key", { key: given });
+          }),
+        },
+        h("p", { class: "hint" }, "Kept in the recordings folder, readable only by this user, and sent only in the proposer's own calls; never shown again. TUNINGFORK_PROPOSER_KEY in the proxy's environment wins over it."),
+        secret,
+        h("div", { class: "form-actions" },
+          h("button", { class: "btn btn-small", type: "submit", "data-control": true }, "Save the key"),
+          key.from === "file"
+            ? h("button", { class: "btn btn-quiet btn-small", type: "button", "data-control": true, onclick: guard(() => save("/proposer/key", { key: null })) }, "Clear the key")
+            : null))),
+    ]));
+  }
+
+  // --- harnesses ------------------------------------------------------------------------
+
+  function drawHarnesses() {
+    replace(harnessesEl, [sandboxCard(state.sandbox), ...state.harnesses.map(harnessCard)]);
+  }
+
+  // Where every launch runs: what its harness sees is what the model reads.
+  function sandboxCard(sandbox) {
+    if (!sandbox) return null;
+    return h("div", { class: "harness-card" },
+      h("div", { class: "harness-head" },
+        h("strong", null, "sandbox"),
+        sandbox.available ? chip(`bubblewrap ${sandbox.version || ""}`.trim(), "ok") : chip("none", "warn")),
+      sandbox.available
+        ? kv([
+            ["every launch sees", h("span", null, "its folder ", h("span", { class: "mono" }, sandbox.workspace), ", its home ", h("span", { class: "mono" }, sandbox.home))],
+            ["hidden from it", "the recordings folder, the runs' folders and the task's spec folder; the rest of the machine read-only"],
+          ])
+        : h("div", { class: "banner banner-warn" },
+            `Launches are not sandboxed: ${sandbox.reason}. Each sees its own folders, whose paths differ from launch to launch, and the model reads them.`));
+  }
+
+  function harnessCard(harness) {
+    const program = input(`executable-${harness.name}`, { value: harness.source === "override" ? harness.executable : "", placeholder: "/absolute/path/to/the/program" });
+    const error = h("div");
+    const save = async (executable) => {
+      try {
+        await api.put(`/connections/harnesses/${enc(harness.name)}`, JSON.stringify({ executable }), "application/json");
+        await load();
+      } catch (failure) {
+        replace(error, formError(failure));
+      }
+    };
+    const pre = harness.preflight || { ok: true, problems: [], notes: [] };
+    return h("div", { class: "harness-card" },
+      h("div", { class: "harness-head" },
+        h("strong", null, harness.name),
+        harness.path ? chip(harness.version || "found", "ok") : chip("not found", "bad"),
+        h("span", { class: "muted small" }, harness.source === "override" ? "named in the recordings folder" : harness.source === "PATH" ? "on PATH" : "")),
+      kv([
+        ["program", harness.path ? h("span", { class: "mono" }, harness.path) : h("span", { class: "muted" }, harness.executable)],
+        ["problem", harness.error],
+      ]),
+      harness.requirements?.length
+        ? h("div", null, h("div", { class: "label" }, "Needs of the server"),
+            h("ul", { class: "small" }, harness.requirements.map((need) =>
+              h("li", null, need.minimum ? `${need.what} of at least ${need.minimum.toLocaleString()}` : need.what.replaceAll("_", " "),
+                h("span", { class: "faint" }, ` — ${need.why}`)))))
+        : null,
+      pre.problems.map((problem) => h("div", { class: "banner banner-bad" }, h("strong", null, "Cannot run here: "), problem)),
+      pre.notes.map((note) => h("div", { class: "banner" }, note)),
+      h("details", { class: "fold" }, h("summary", null, "Use another program"),
+        h("div", { class: "stack", style: { gap: "8px", marginTop: "8px" } },
+          program,
+          h("div", { class: "form-actions" },
+            h("button", { class: "btn btn-small", type: "button", "data-control": true, onclick: guard(() => save(program.value.trim() || null)) }, "Save"),
+            harness.source === "override"
+              ? h("button", { class: "btn btn-quiet btn-small", type: "button", "data-control": true, onclick: guard(() => save(null)) }, "Use the one on PATH")
+              : null),
+          error)));
+  }
+
+  // --- the proxy ------------------------------------------------------------------------
+
+  function drawProxy() {
+    const proxy = state.proxy;
+    replace(proxyEl, panel("This proxy", [
+      kv([
+        ["recordings", h("span", { class: "mono" }, proxy.home)],
+        ["listening on", h("span", { class: "mono" }, `${proxy.host}:${proxy.port}`)],
+        ["calls at once", String(proxy.max_inflight)],
+        ["jobs at once", String(proxy.jobs)],
+        ["never forwards to", proxy.protected.length ? h("span", { class: "mono" }, proxy.protected.join(", ")) : "nothing protected"],
+      ]),
+      state.busy?.length ? h("p", { class: "hint" }, `In use: ${state.busy.join("; ")}.`) : null,
+      h("p", { class: "hint" }, "These change only with a restart:"),
+      command(proxy.restart),
+    ]));
+  }
+
+  await load();
+  // A switch made elsewhere, or a check that finished, shows here.
+  scope.on((event) => {
+    if (event.type === "connections") load();
+  });
+}

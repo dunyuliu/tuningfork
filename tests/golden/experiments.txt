@@ -1,0 +1,6 @@
+ experiment  kind      arm       run       step  samples  created        
+ <experiment 5>    ab        variant   <run pilot>  1     2/2      <when> 
+ <experiment 4>    ab        original  <run pilot>  1     2/2      <when> 
+ <experiment 3>    ab        variant   <run pilot>  1     3/3      <when> 
+ <experiment 2>    ab        original  <run pilot>  1     3/3      <when> 
+ <experiment 1>    resample  original  <run pilot>  0     4/4      <when> 

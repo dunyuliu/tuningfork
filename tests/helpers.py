@@ -1,0 +1,382 @@
+"""Small helpers shared by tests."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import socket
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator, Sequence
+
+import uvicorn
+
+from tuningfork.harness.base import LaunchSpec
+from tuningfork.launches import LaunchThreads, request_path, split
+from tuningfork.ops.forks import execute_forks, prepare_fork
+from tuningfork.runner import BatchRunner
+from tuningfork.specs import Eval, TaskSpec, TuningforkOptions
+from tuningfork.store.db import Step, Store
+from tests.mock_server import MockTurn
+
+#: Each launch's threads, as the proxy would track them, for harnesses that record directly.
+_THREADS: dict[str, LaunchThreads] = {}
+
+
+def token_in(base_url: str) -> str:
+    """The launch token in a launched harness's base URL."""
+    from urllib.parse import urlsplit
+
+    token, _ = split(urlsplit(base_url).path)
+    assert token, f"not a launch URL: {base_url}"
+    return token
+
+
+def record_launched(store: Store, token: str, request: dict[str, Any], **step: Any) -> Step:
+    """Record a call the way the proxy does for a launched harness: under its launch, in the
+    thread its messages continue."""
+    launch = store.get_launch(token)
+    assert launch is not None, f"no launch {token}"
+    threads = _THREADS.setdefault(
+        token,
+        LaunchThreads(
+            token, label=launch.label, task_id=launch.task_id,
+            main_role="fork" if launch.kind == "fork" else "main",
+        ),
+    )
+    assignment = threads.assign(request_path(request))
+    return store.record_step(request=request, assignment=assignment, **step)
+
+
+def all_steps(store: Store) -> list[Step]:
+    """Every recorded step, oldest run first, in step order."""
+    runs = sorted(store.runs(limit=1000, threads=True), key=lambda run: run.started_at)
+    return [step for run in runs for step in store.steps(run.id)]
+
+
+def only_step(store: Store) -> Step:
+    steps = all_steps(store)
+    assert len(steps) == 1, f"expected exactly one step, found {len(steps)}"
+    return steps[0]
+
+
+def text_message(content: str) -> dict[str, Any]:
+    return {"role": "assistant", "content": content}
+
+
+def tool_call_message(name: str, arguments: dict[str, Any], call_id: str = "call_1") -> dict:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        ],
+    }
+
+
+def as_response(message: dict[str, Any], finish_reason: str = "stop") -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-x",
+        "object": "chat.completion",
+        "model": "m",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+
+
+# --- a recorded pilot run, shaped like a real Hermes one ---------------------------------
+
+SKILL = "---\nname: tally-report\n---\n\n# Tally report\n\nWrite the totals to report.json.\n"
+VARIANT = (
+    "---\nname: tally-report\n---\n\n# Tally report\n\n"
+    "Write the totals to report.json, using the keys row_count and amount_total.\n"
+)
+DEFAULTS = {"temperature": 1.0, "top_p": 0.95, "n_ctx": 65536}
+PROPS = {
+    "default_generation_settings": {
+        "n_ctx": 65536,
+        "params": {"temperature": 1.0, "top_p": 0.95},
+    }
+}
+READ = tool_call_message("read_file", {"path": "data.csv"}, call_id="c1")
+
+
+def system_prompt(skill: str = SKILL) -> str:
+    """Mirrors how Hermes 0.18.2 inlines a preloaded skill into its system prompt."""
+    return (
+        "You are an agent.\n\n"
+        '[IMPORTANT: The user launched this CLI session with the "tally-report" skill '
+        f"preloaded.]\n\n{skill}\n[Skill directory: /tmp/run/home/skills/tally-report]\n"
+    )
+
+
+def record_pilot(store: Store, *, model: str = "mock-model", server_defaults=DEFAULTS) -> str:
+    """Record a two-step run: read the CSV, then write the report."""
+    store.begin_run("pilot", "tally-report/1")
+    base = {
+        "model": model,
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        "max_tokens": 65536,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    first = [
+        {"role": "system", "content": system_prompt()},
+        {"role": "user", "content": "Use the tally-report skill on data.csv."},
+    ]
+    store.record_step(
+        request={**base, "messages": first},
+        response=as_response(READ, finish_reason="tool_calls"),
+        server_defaults=server_defaults,
+    )
+    second = [*first, READ, {"role": "tool", "tool_call_id": "c1", "content": "id,amount\n1,10\n"}]
+    store.record_step(
+        request={**base, "messages": second},
+        response=as_response(tool_call_message("write_file", {"path": "report.json"})),
+        server_defaults=server_defaults,
+    )
+    run = store.get_run("pilot")
+    assert run is not None
+    return run.id
+
+
+def record_run(
+    store: Store,
+    label: str,
+    assistant_messages: Sequence[dict[str, Any]],
+    *,
+    prompt: str = "do the task",
+    task_id: str | None = None,
+) -> str:
+    """Record a synthetic multi-step run and return its id.
+
+    Each assistant message is followed by a user turn, so successive requests extend the
+    same path through the tree exactly as a real conversation would.
+    """
+    store.begin_run(label, task_id)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    for message in assistant_messages:
+        store.record_step(
+            request={"model": "m", "messages": list(messages)},
+            response=as_response(message),
+        )
+        messages.append(message)
+        messages.append({"role": "user", "content": "continue"})
+    run = store.get_run(label)
+    assert run is not None
+    return run.id
+
+
+async def until(predicate: Callable[[], Any], timeout: float = 3.0) -> Any:
+    """Poll until `predicate()` is truthy. For waiting on a call to reach a breakpoint."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out waiting for the condition")
+
+
+def sse_payloads(body: bytes) -> list[str]:
+    """The `data:` payloads of an SSE body, keepalive comments excluded."""
+    return [
+        line[len("data: "):]
+        for line in body.decode("utf-8").splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def control_headers(app) -> dict[str, str]:
+    """What a client sends to change a proxy's state: its access token."""
+    from tuningfork.access import HEADER
+
+    return {HEADER: app.state.access.token}
+
+
+def mcp_headers(app) -> dict[str, str]:
+    """What an MCP client sends to the proxy's MCP endpoint: the MCP token, which opens it alone."""
+    from tuningfork.access import HEADER
+
+    return {HEADER: app.state.access.mcp_token}
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@contextmanager
+def serving(app) -> Iterator[str]:
+    """Run an app on a real local socket, in a thread, for as long as the block lasts.
+
+    For what only exists over a real connection: a never-ending event stream, and the CLI,
+    which talks HTTP to a proxy in another process.
+    """
+    port = free_port()
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", lifespan="off")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started:
+        if time.monotonic() > deadline:
+            raise RuntimeError("test server did not start")
+        time.sleep(0.01)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        # Jobs first, while the server still answers them: they write to the store, which
+        # the caller closes next.
+        jobs = getattr(getattr(app, "state", None), "jobs", None)
+        if jobs is not None:
+            jobs.shutdown(10)
+        server.should_exit = True
+        thread.join(5)
+
+
+# --- a real harness process, a task, and a proxy to run it through --------------------------
+
+FAKE_AGENT = Path(__file__).parent / "fake_agent.py"
+#: The skill as the task's folder holds it; `VARIANT` is its edit.
+ORIGINAL = SKILL
+CHECK = (
+    "python3 -c \"import json,sys; d=json.load(open('report.json'));"
+    " sys.exit(0 if d.get('row_count')==4 else 1)\""
+)
+
+
+class FakeAgent:
+    """Launches `tests/fake_agent.py` the way an adapter launches a real harness."""
+
+    name = "fake"
+    subagent_tools = frozenset()
+    volatile = ()
+
+    def prepare_home(self, home, *, base_url: str, model: str, max_turns: int = 30) -> Path:
+        home = Path(home)
+        (home / "skills").mkdir(parents=True, exist_ok=True)
+        (home / "agent.json").write_text(json.dumps({"base_url": base_url, "model": model}))
+        return home
+
+    def launch(self, prompt, *, home, workspace, skills=(), extra_args=(), max_turns=30):
+        config = json.loads((Path(home) / "agent.json").read_text())
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "FAKE_BASE_URL": config["base_url"],
+            "FAKE_MODEL": config["model"],
+            "FAKE_HOME": str(home),
+            "FAKE_MAX_TURNS": str(max_turns),
+        }
+        if os.environ.get("FAKE_NOISE"):
+            env["FAKE_NOISE"] = os.environ["FAKE_NOISE"]
+        return LaunchSpec(argv=(sys.executable, str(FAKE_AGENT), prompt), env=env, cwd=Path(workspace))
+
+    def skill_roots(self, home) -> tuple[Path, ...]:
+        return (Path(home) / "skills",)
+
+    def skill_spans(self, request) -> list:
+        return []
+
+
+def tally_model(payload: dict) -> MockTurn:
+    """The model: read the data, write the report — its keys as the wording in its context
+    asks, at the absolute path of the workspace it is told it is in — then say so."""
+    messages = payload["messages"]
+    system = messages[0]["content"]
+    results = [m for m in messages if m["role"] == "tool"]
+    workdir = re.search(r"Working directory: (\S+)", system).group(1)
+    if not results:
+        return MockTurn(tool_calls=[{"name": "read_file", "arguments": {"path": "data.csv"}}])
+    if len(results) == 1:
+        keys = (
+            {"row_count": 4, "amount_total": 61.5}
+            if "row_count" in system
+            else {"count": 4, "total": 61.5}
+        )
+        return MockTurn(tool_calls=[{"name": "write_file", "arguments": {
+            "path": f"{workdir}/report.json", "content": json.dumps(keys)}}])
+    return MockTurn(content="The report is written.")
+
+
+@dataclass
+class Stack:
+    """A real proxy on a socket, the mock server as its model, a task, and a store."""
+
+    url: str
+    store: Store
+    app: object
+    mock: object
+    tmp: Path
+    spec: TaskSpec
+    item: Eval
+
+    def record(self):
+        """One batch run of the task, as the source a fork replays."""
+        runner = BatchRunner(
+            self.store, FakeAgent(), base_url=f"{self.url}/v1", model="m",
+            workdir=self.tmp / "batches", settle=0.1,
+        )
+        (outcome,) = runner.run(self.spec, self.item, 1).outcomes
+        assert outcome.run_id, outcome.stderr
+        return outcome
+
+    def fork(self, run_id: str, step: str, n: int = 1, **options):
+        plan = prepare_fork(
+            self.store, run_id, step, base_url=f"{self.url}/v1",
+            workdir=self.tmp / "forks", **options,
+        )
+        return plan, execute_forks(self.store, plan, n)
+
+
+@contextmanager
+def task_stack(tmp_path: Path, mock_server: Any, monkeypatch: Any, *, max_inflight: int = 4) -> Iterator[Stack]:
+    """The tally task, runnable end to end with no model: `FakeAgent` as the harness (as
+    "fake" in ADAPTERS), `tally_model` as the mock server's responder, a real proxy on a
+    socket, and a skill folder beside the spec."""
+    import httpx
+
+    from tuningfork.config import Settings
+    from tuningfork.harness import ADAPTERS
+    from tuningfork.proxy.app import create_app
+
+    monkeypatch.setitem(ADAPTERS, "fake", FakeAgent)
+    mock_server.responder = tally_model
+    home = tmp_path / "store"
+    skill = tmp_path / "skills-src" / "tally-report"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(ORIGINAL, encoding="utf-8")
+    item = Eval(
+        id="1",
+        prompt="Summarize data.csv into report.json.",
+        files=[{"path": "data.csv", "content": "id,amount\n1,10\n2,20\n3,30\n4,1.5\n"}],
+        tuningfork=TuningforkOptions(check=CHECK, skills=["tally-report"], max_turns=6, timeout=60),
+    )
+    spec = TaskSpec(
+        skill_name="tally-report", evals=[item], path=tmp_path / "spec.json",
+        skill_dir="skills-src/tally-report",
+    )
+    upstream = httpx.AsyncClient(transport=httpx.ASGITransport(app=mock_server.app), timeout=30)
+    app = create_app(
+        Settings(upstream_base_url="http://upstream.test", home=home, max_inflight=max_inflight),
+        client=upstream,
+    )
+    store = Store(home)
+    try:
+        with serving(app) as url:
+            yield Stack(url, store, app, mock_server, tmp_path, spec, item)
+    finally:
+        store.close()
+        app.state.recorder.store.close()
+        asyncio.run(upstream.aclose())

@@ -1,0 +1,3 @@
+# Keep LF in the repository and in working copies, on Windows too: a CRLF checkout breaks
+# shell scripts with obscure `\r` errors, and changes test fixtures that must stay byte-exact.
+* text=auto eol=lf
